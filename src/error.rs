@@ -2,6 +2,7 @@
 
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
+use std::time::Duration;
 
 use snafu::{Backtrace, Snafu};
 use validator::ValidationErrors;
@@ -57,6 +58,35 @@ pub enum ColmenaError {
 
     #[snafu(display("Could not determine current profile"))]
     FailedToGetCurrentProfile,
+
+    #[snafu(display(
+        "Timed out waiting for activation on host {} after {:?}",
+        hostname,
+        timeout
+    ))]
+    ActivationTimeout { hostname: String, timeout: Duration },
+
+    #[snafu(display("{}", match result.as_str() {
+        "not-found" => format!(
+            "Activation unit {} on host {} was not found - it may not have started (SSH may have dropped before systemd-run executed)",
+            unit, hostname
+        ),
+        _ => format!(
+            "Activation unit {} on host {} failed with result {}{}",
+            unit,
+            hostname,
+            result,
+            exit_status
+                .map(|status| format!(" (exit status {})", status))
+                .unwrap_or_default()
+        ),
+    }))]
+    ActivationFailed {
+        hostname: String,
+        unit: String,
+        result: String,
+        exit_status: Option<i32>,
+    },
 
     #[snafu(display("Current Nix version does not support Flakes"))]
     NoFlakesSupport,
