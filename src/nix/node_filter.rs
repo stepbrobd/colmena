@@ -8,7 +8,7 @@ use std::str::FromStr;
 use clap::Args;
 use glob::Pattern as GlobPattern;
 
-use super::{ColmenaError, ColmenaResult, NodeConfig, NodeName};
+use super::{ColmenaError, ColmenaResult, NodeConfig, NodeName, SystemType};
 
 #[derive(Debug, Default, Args)]
 pub struct NodeFilterOpts {
@@ -247,6 +247,7 @@ mod tests {
             privilege_escalation_command: vec![],
             extra_ssh_options: vec![],
             keys: HashMap::new(),
+            system_type: SystemType::default(),
         };
 
         let mut nodes = HashMap::new();

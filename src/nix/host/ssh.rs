@@ -13,8 +13,13 @@ use uuid::Uuid;
 use super::{key_uploader, CopyDirection, CopyOptions, Host, RebootOptions};
 use crate::error::{ColmenaError, ColmenaResult};
 use crate::job::JobHandle;
-use crate::nix::{Goal, Key, Profile, StorePath, CURRENT_PROFILE, SYSTEM_PROFILE};
+use crate::nix::{Goal, Key, Profile, StorePath, SystemType, CURRENT_PROFILE, SYSTEM_PROFILE};
 use crate::util::{CommandExecution, CommandExt};
+
+/// nix bin directory on NixOS and nix-darwin managed systems
+/// root's PATH on macOS doesn't include nix binaries by default
+/// and nix-daemon needs an absolute path for ssh-ng:// remote-program
+const NIX_BIN_PATH: &str = "/run/current-system/sw/bin";
 
 const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -41,6 +46,10 @@ pub struct Ssh {
 
     /// Whether to use the experimental `nix copy` command.
     use_nix3_copy: bool,
+
+    /// The system type (NixOS or Darwin).
+    /// Used to handle platform-specific differences like nix-daemon path on macOS.
+    system_type: SystemType,
 
     job: Option<JobHandle>,
 }
@@ -207,19 +216,35 @@ impl Host for Ssh {
         Ok(())
     }
 
-    async fn activate(&mut self, profile: &Profile, goal: Goal) -> ColmenaResult<()> {
+    async fn activate(
+        &mut self,
+        profile: &Profile,
+        goal: Goal,
+        system_type: SystemType,
+    ) -> ColmenaResult<()> {
         if !goal.requires_activation() {
+            return Err(ColmenaError::Unsupported);
+        }
+
+        // Check if this goal is supported for Darwin
+        if system_type.is_darwin() && !goal.supported_on_darwin() {
             return Err(ColmenaError::Unsupported);
         }
 
         if goal.should_switch_profile() {
             let path = profile.as_path().to_str().unwrap();
-            let set_profile = self.ssh(&["nix-env", "--profile", SYSTEM_PROFILE, "--set", path]);
+            let nix_env = format!("{}/nix-env", NIX_BIN_PATH);
+            let set_profile = self.ssh(&[&nix_env, "--profile", SYSTEM_PROFILE, "--set", path]);
             self.run_command(set_profile).await?;
         }
 
-        let activation_command = profile.activation_command(goal).unwrap();
-        if matches!(goal, Goal::Switch | Goal::Test) {
+        let activation_command = profile
+            .activation_command(goal, system_type)
+            .ok_or(ColmenaError::Unsupported)?;
+
+        // Use detached activation for NixOS Switch/Test goals (survives SSH drops).
+        // Darwin doesn't have systemd, so always use direct activation.
+        if system_type.is_nixos() && matches!(goal, Goal::Switch | Goal::Test) {
             self.activate_detached(&activation_command).await
         } else {
             let v: Vec<&str> = activation_command.iter().map(|s| &**s).collect();
@@ -272,7 +297,8 @@ impl Host for Ssh {
             return self.initate_reboot().await;
         }
 
-        let old_id = self.get_boot_id().await?;
+        let system_type = options.get_system_type();
+        let old_id = self.get_boot_id(system_type).await?;
 
         self.initate_reboot().await?;
 
@@ -283,7 +309,7 @@ impl Host for Ssh {
         // Wait for node to come back up
         loop {
             // Ignore errors while waiting
-            if let Ok(new_id) = self.get_boot_id().await {
+            if let Ok(new_id) = self.get_boot_id(system_type).await {
                 if new_id != old_id {
                     break;
                 }
@@ -315,6 +341,7 @@ impl Ssh {
             privilege_escalation_command: Vec::new(),
             extra_ssh_options: Vec::new(),
             use_nix3_copy: false,
+            system_type: SystemType::default(),
             job: None,
         }
     }
@@ -337,6 +364,10 @@ impl Ssh {
 
     pub fn set_use_nix3_copy(&mut self, enable: bool) {
         self.use_nix3_copy = enable;
+    }
+
+    pub fn set_system_type(&mut self, system_type: SystemType) {
+        self.system_type = system_type;
     }
 
     pub fn upcast(self) -> Box<dyn Host> {
@@ -420,10 +451,22 @@ impl Ssh {
                 }
             }
 
+            // Build the store URI with appropriate query parameters
+            // For darwin, we need to specify the remote-program because root's PATH
+            // on macOS doesn't include nix binaries by default
             let mut store_uri = format!("ssh-ng://{}", self.ssh_target());
+            let mut query_params = Vec::new();
+
+            query_params.push(format!("remote-program={}/nix-daemon", NIX_BIN_PATH));
+
             if options.gzip {
-                store_uri += "?compress=true";
+                query_params.push("compress=true".to_string());
             }
+
+            if !query_params.is_empty() {
+                store_uri = format!("{}?{}", store_uri, query_params.join("&"));
+            }
+
             command.arg(store_uri);
 
             command.arg(path.as_path());
@@ -516,11 +559,16 @@ impl Ssh {
     }
 
     /// Returns the current Boot ID.
-    async fn get_boot_id(&mut self) -> ColmenaResult<BootId> {
-        let boot_id = self
-            .ssh(&["cat", "/proc/sys/kernel/random/boot_id"])
-            .capture_output()
-            .await?;
+    ///
+    /// For NixOS, reads from /proc/sys/kernel/random/boot_id.
+    /// For Darwin, uses sysctl kern.bootsessionuuid.
+    async fn get_boot_id(&mut self, system_type: SystemType) -> ColmenaResult<BootId> {
+        let command = match system_type {
+            SystemType::NixOS => vec!["cat", "/proc/sys/kernel/random/boot_id"],
+            SystemType::Darwin => vec!["sysctl", "-n", "kern.bootsessionuuid"],
+        };
+
+        let boot_id = self.ssh(&command).capture_output().await?;
 
         Ok(BootId(boot_id))
     }

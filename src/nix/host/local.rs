@@ -8,7 +8,9 @@ use tokio::process::Command;
 use super::{key_uploader, CopyDirection, CopyOptions, Host};
 use crate::error::{ColmenaError, ColmenaResult};
 use crate::job::JobHandle;
-use crate::nix::{Goal, Key, NixFlags, Profile, StorePath, CURRENT_PROFILE, SYSTEM_PROFILE};
+use crate::nix::{
+    Goal, Key, NixFlags, Profile, StorePath, SystemType, CURRENT_PROFILE, SYSTEM_PROFILE,
+};
 use crate::util::{CommandExecution, CommandExt};
 
 /// The local machine running Colmena.
@@ -78,8 +80,18 @@ impl Host for Local {
         Ok(())
     }
 
-    async fn activate(&mut self, profile: &Profile, goal: Goal) -> ColmenaResult<()> {
+    async fn activate(
+        &mut self,
+        profile: &Profile,
+        goal: Goal,
+        system_type: SystemType,
+    ) -> ColmenaResult<()> {
         if !goal.requires_activation() {
+            return Err(ColmenaError::Unsupported);
+        }
+
+        // Check if this goal is supported for Darwin
+        if system_type.is_darwin() && !goal.supported_on_darwin() {
             return Err(ColmenaError::Unsupported);
         }
 
@@ -91,7 +103,9 @@ impl Host for Local {
         }
 
         let command = {
-            let activation_command = profile.activation_command(goal).unwrap();
+            let activation_command = profile
+                .activation_command(goal, system_type)
+                .ok_or(ColmenaError::Unsupported)?;
             self.make_privileged_command(&activation_command)
         };
 
