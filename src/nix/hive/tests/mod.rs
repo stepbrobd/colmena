@@ -200,6 +200,16 @@ fn test_parse_makehive_flake() {
         &nodes.keys().map(NodeName::as_str).collect::<Vec<&str>>(),
     ));
 
+    // The streaming evaluator passes this expression standalone (no
+    // `nix eval --apply`), so it must be self-contained rather than a
+    // bare lambda waiting for the hive argument.
+    let expr = hive
+        .eval_selected_expr(&[node!("host-a")])
+        .unwrap()
+        .expression();
+    assert!(expr.contains("builtins.getFlake"));
+    assert!(!expr.starts_with("with builtins; hive:"));
+
     drop(flake_dir);
 }
 

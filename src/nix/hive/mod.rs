@@ -589,11 +589,32 @@ impl<'hive> NixInstantiate<'hive> {
 
 impl NixExpression for EvalSelectedExpression<'_> {
     fn expression(&self) -> String {
-        format!(
-            "{} hive.evalSelected {}",
-            self.hive.get_base_expression(),
-            self.nodes_expr.expression(),
-        )
+        match self.hive.evaluation_method {
+            EvaluationMethod::NixInstantiate => format!(
+                "{} hive.evalSelected {}",
+                self.hive.get_base_expression(),
+                self.nodes_expr.expression(),
+            ),
+            // The DirectFlakeEval base expression is a lambda meant for
+            // `nix eval --apply`. This expression is passed standalone to
+            // consumers like nix-eval-jobs (which silently produces no
+            // results for an uncallable lambda), so apply it to the
+            // flake's colmenaHive output ourselves.
+            EvaluationMethod::DirectFlakeEval => {
+                let flake = if let HivePath::Flake(flake) = self.hive.path() {
+                    flake
+                } else {
+                    panic!("The DirectFlakeEval evaluation method only support flakes");
+                };
+
+                format!(
+                    "({} hive.evalSelected {}) (builtins.getFlake \"{}\").outputs.colmenaHive",
+                    self.hive.get_base_expression(),
+                    self.nodes_expr.expression(),
+                    flake.locked_uri(),
+                )
+            }
+        }
     }
 
     fn requires_flakes(&self) -> bool {
