@@ -400,6 +400,7 @@ fn test_nixpkgs_overlay_meta_nixpkgs() {
       {
         meta = {
           nixpkgs = import <nixpkgs> {
+            system = "x86_64-linux";
             overlays = [
               (self: super: { my-coreutils = super.coreutils; })
             ];
@@ -421,6 +422,11 @@ fn test_nixpkgs_overlay_node_config() {
     TempHive::eval_success(
         r#"
       {
+        meta = {
+          nixpkgs = import <nixpkgs> {
+            system = "x86_64-linux";
+          };
+        };
         test = { pkgs, ... }: {
           boot.isContainer = true;
           nixpkgs.overlays = [
@@ -442,6 +448,7 @@ fn test_nixpkgs_overlay_both() {
       {
         meta = {
           nixpkgs = import <nixpkgs> {
+            system = "x86_64-linux";
             overlays = [
               (self: super: { meta-coreutils = super.coreutils; })
             ];
@@ -468,6 +475,7 @@ fn test_nixpkgs_config_meta_nixpkgs() {
       {
         meta = {
           nixpkgs = import <nixpkgs> {
+            system = "x86_64-linux";
             config = {
               allowUnfree = true;
             };
@@ -491,6 +499,11 @@ fn test_nixpkgs_config_node_config() {
     TempHive::eval_success(
         r#"
       {
+        meta = {
+          nixpkgs = import <nixpkgs> {
+            system = "x86_64-linux";
+          };
+        };
         test = { pkgs, ... }: {
           nixpkgs.config = {
             allowUnfree = true;
@@ -510,6 +523,7 @@ fn test_nixpkgs_config_override() {
       {
         meta = {
           nixpkgs = import <nixpkgs> {
+            system = "x86_64-linux";
             config = {
               allowUnfree = META_VAL;
             };

@@ -44,6 +44,9 @@ impl Flake {
             .to_str()
             .expect("Flake directory path contains non-UTF-8 characters");
 
+        // Ensure the lock file is written before flake narHash is recorded
+        let _ = lock_flake_quiet(flake).await;
+
         let metadata = FlakeMetadata::resolve(flake).await?;
 
         Ok(Self {
