@@ -8,7 +8,7 @@ use std::str::FromStr;
 use clap::Args;
 use glob::Pattern as GlobPattern;
 
-use super::{ColmenaError, ColmenaResult, NodeConfig, NodeName, SystemType};
+use super::{ColmenaError, ColmenaResult, NodeConfig, NodeName};
 
 #[derive(Debug, Default, Args)]
 pub struct NodeFilterOpts {
@@ -164,6 +164,8 @@ mod tests {
     use super::*;
 
     use std::collections::{HashMap, HashSet};
+
+    use crate::nix::SystemType;
 
     macro_rules! node {
         ($n:expr) => {
