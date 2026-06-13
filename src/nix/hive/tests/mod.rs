@@ -200,6 +200,13 @@ fn test_parse_makehive_flake() {
         &nodes.keys().map(NodeName::as_str).collect::<Vec<&str>>(),
     ));
 
+    let expr = hive
+        .eval_selected_expr(&[node!("host-a")])
+        .unwrap()
+        .expression();
+    assert!(expr.contains("builtins.getFlake"));
+    assert!(!expr.starts_with("with builtins; hive:"));
+
     drop(flake_dir);
 }
 
