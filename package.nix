@@ -12,7 +12,6 @@ let
   srcIgnored = fs.unions [
     ./.github
     ./CNAME
-    ./renovate.json
 
     ./manual
     ./integration-tests
