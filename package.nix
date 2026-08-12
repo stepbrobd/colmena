@@ -15,7 +15,6 @@ let
     ./manual
     ./integration-tests
 
-    ./nix
     ./default.nix
     ./flake-compat.nix
     ./package.nix
