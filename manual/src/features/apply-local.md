@@ -3,7 +3,7 @@
 For some machines, you may still want to stick with the manual `nixos-rebuild`-type of workflow.
 Colmena allows you to build and activate configurations on the host running Colmena itself, provided that:
 
-1. The node must be running NixOS.
+1. The node must be running NixOS or nix-darwin.
 1. The node must have `deployment.allowLocalDeployment` set to `true`.
 1. The node's _attribute name_ must match the hostname of the machine.
 

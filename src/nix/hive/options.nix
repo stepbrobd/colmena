@@ -147,7 +147,7 @@ rec {
               Colmena.
 
               For local deployment to work, all of the following must be true:
-              - The node must be running NixOS.
+              - The node must be running NixOS or nix-darwin.
               - The node must have deployment.allowLocalDeployment set to true.
               - The node's networking.hostName must match the hostname.
 
@@ -186,6 +186,24 @@ rec {
             '';
             type = types.listOf types.str;
             default = [ ];
+          };
+          systemType = lib.mkOption {
+            description = ''
+              The type of system to deploy.
+
+              - "nixos": NixOS, activated with switch-to-configuration
+              - "darwin": macOS with nix-darwin, activated with darwin-rebuild
+
+              When unset, nodes defined in a flake's `darwinConfigurations`
+              are darwin and all other nodes are nixos.
+            '';
+            type = types.nullOr (
+              types.enum [
+                "nixos"
+                "darwin"
+              ]
+            );
+            default = null;
           };
           keys = lib.mkOption {
             description = ''
@@ -278,6 +296,26 @@ rec {
           '';
           type = types.attrsOf types.unspecified;
           default = { };
+        };
+        nix-darwin = lib.mkOption {
+          description = ''
+            The nix-darwin flake input used to evaluate nix-darwin nodes.
+
+            Required for nodes with `deployment.systemType = "darwin"`.
+            For example:
+
+              {
+                inputs.nix-darwin.url = "github:nix-darwin/nix-darwin";
+                outputs = { nix-darwin, ... }: {
+                  colmena = {
+                    meta.nix-darwin = nix-darwin;
+                    # ...
+                  };
+                };
+              }
+          '';
+          type = types.unspecified;
+          default = null;
         };
         nodeSpecialArgs = lib.mkOption {
           description = ''

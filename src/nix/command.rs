@@ -3,9 +3,8 @@
 //! It renders one set of [`NixFlags`] per executable and omits the flags
 //! that executable rejects.
 
-use std::borrow::Cow;
-use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
 use tokio::process::Command;
 
@@ -40,14 +39,23 @@ struct Caps {
 }
 
 impl NixExe {
-    fn executable(&self) -> Cow<'static, OsStr> {
-        match self {
-            Self::Nix => OsStr::new("nix").into(),
-            Self::NixInstantiate => OsStr::new("nix-instantiate").into(),
-            Self::NixStore => OsStr::new("nix-store").into(),
-            Self::NixEnv => OsStr::new("nix-env").into(),
-            Self::NixCopyClosure => OsStr::new("nix-copy-closure").into(),
-            Self::NixEvalJobs(path) => path.clone().into_os_string().into(),
+    /// Returns the executable, resolved in `bin_dir` if given.
+    ///
+    /// A pinned `nix-eval-jobs` is already an absolute path and is
+    /// left untouched.
+    fn executable(&self, bin_dir: Option<&Path>) -> OsString {
+        let name = match self {
+            Self::Nix => "nix",
+            Self::NixInstantiate => "nix-instantiate",
+            Self::NixStore => "nix-store",
+            Self::NixEnv => "nix-env",
+            Self::NixCopyClosure => "nix-copy-closure",
+            Self::NixEvalJobs(path) => return path.clone().into_os_string(),
+        };
+
+        match bin_dir {
+            Some(dir) => dir.join(name).into_os_string(),
+            None => OsString::from(name),
         }
     }
 
@@ -79,6 +87,7 @@ impl NixExe {
 #[must_use]
 pub struct NixCommand {
     exe: NixExe,
+    bin_dir: Option<PathBuf>,
     flags: NixFlags,
     extra_features: Vec<&'static str>,
     args: Vec<OsString>,
@@ -118,6 +127,7 @@ impl NixCommand {
     fn new(exe: NixExe, flags: NixFlags) -> Self {
         Self {
             exe,
+            bin_dir: None,
             flags,
             extra_features: Vec::new(),
             args: Vec::new(),
@@ -144,9 +154,15 @@ impl NixCommand {
         self
     }
 
+    /// Resolves the executable in `dir` instead of through PATH.
+    pub fn bin_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.bin_dir = Some(dir.into());
+        self
+    }
+
     /// Builds a [`Command`] ready to be spawned locally.
     pub fn build(self) -> Command {
-        let mut command = Command::new(self.exe.executable());
+        let mut command = Command::new(self.exe.executable(self.bin_dir.as_deref()));
         command.args(&self.args);
         command.args(self.render_flags());
         command
@@ -162,8 +178,7 @@ impl NixCommand {
 
         let executable = self
             .exe
-            .executable()
-            .into_owned()
+            .executable(self.bin_dir.as_deref())
             .into_string()
             .expect("Executable path must be valid UTF-8");
 
@@ -306,6 +321,19 @@ mod tests {
         assert_eq!(
             argv,
             vec!["nix-store", "--option", "builders", "@/path/to/machines"]
+        );
+    }
+
+    #[test]
+    fn test_bin_dir_prefixes_executable() {
+        let argv = NixCommand::nix_env(NixFlags::default())
+            .bin_dir("/run/current-system/sw/bin")
+            .arg("--version")
+            .into_argv();
+
+        assert_eq!(
+            argv,
+            vec!["/run/current-system/sw/bin/nix-env", "--version"]
         );
     }
 

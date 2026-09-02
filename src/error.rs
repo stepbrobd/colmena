@@ -6,7 +6,7 @@ use std::process::ExitStatus;
 use snafu::{Backtrace, Snafu};
 use validator::ValidationErrors;
 
-use crate::nix::{Profile, StorePath, key};
+use crate::nix::{Goal, Profile, StorePath, SystemType, key};
 
 pub type ColmenaResult<T> = Result<T, ColmenaError>;
 
@@ -30,6 +30,9 @@ pub enum ColmenaError {
 
     #[snafu(display("This operation is not supported"))]
     Unsupported,
+
+    #[snafu(display("{} has no {} goal", system_type, goal))]
+    UnsupportedGoal { goal: Goal, system_type: SystemType },
 
     #[snafu(display("Invalid Nix store path"))]
     InvalidStorePath,

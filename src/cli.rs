@@ -180,7 +180,6 @@ struct Opts {
 enum Command {
     Apply(command::apply::Opts),
 
-    #[cfg(target_os = "linux")]
     ApplyLocal(command::apply_local::Opts),
 
     /// Build configurations but not push to remote machines
@@ -342,7 +341,6 @@ pub async fn run() {
 
     match opts.command {
         Command::Apply(args) => r(command::apply::run(hive, args)).await,
-        #[cfg(target_os = "linux")]
         Command::ApplyLocal(args) => r(command::apply_local::run(hive, args)).await,
         Command::Eval(args) => r(command::eval::run(hive, args)).await,
         Command::Exec(args) => r(command::exec::run(hive, args)).await,

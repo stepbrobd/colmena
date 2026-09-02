@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use const_format::formatcp;
 
-use super::{Goal, Key, Profile, StorePath};
+use super::{CURRENT_PROFILE, Goal, Key, Profile, SYSTEM_PROFILE, StorePath};
 use crate::error::{ColmenaError, ColmenaResult};
 use crate::job::JobHandle;
 
@@ -13,6 +14,14 @@ mod local;
 pub use local::Local;
 
 mod key_uploader;
+
+/// Prints the main system profile, falling back to the current one.
+///
+/// `readlink -f` also works on macOS, `-e` is GNU only. The `-e` test
+/// keeps the fallback, since `-f` also prints a target that does not exist.
+const MAIN_PROFILE_SCRIPT: &str = formatcp!(
+    "if [ -e {SYSTEM_PROFILE} ]; then readlink -f {SYSTEM_PROFILE}; else readlink -f {CURRENT_PROFILE}; fi"
+);
 
 #[derive(Copy, Clone, Debug)]
 pub enum CopyDirection {
@@ -84,7 +93,7 @@ impl RebootOptions {
     }
 }
 
-/// A Nix(OS) host.
+/// A NixOS or nix-darwin host.
 ///
 /// The underlying implementation must be Send and Sync.
 #[async_trait]
@@ -167,7 +176,7 @@ pub trait Host: Send + Sync + std::fmt::Debug {
     /// to `/run/current-system` if it doesn't exist.
     async fn get_main_system_profile(&mut self) -> ColmenaResult<Profile>;
 
-    /// Activates a system profile on the host, if it runs NixOS.
+    /// Activates a system profile on the host.
     ///
     /// The profile must already exist on the host. You should probably use deploy instead.
     #[allow(unused_variables)]

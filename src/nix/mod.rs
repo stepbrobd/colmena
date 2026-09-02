@@ -51,6 +51,28 @@ pub const SYSTEM_PROFILE: &str = "/nix/var/nix/profiles/system";
 /// Path to the system profile that's currently active.
 pub const CURRENT_PROFILE: &str = "/run/current-system";
 
+/// Path to the binaries of the active system profile.
+///
+/// Root's PATH on macOS lacks Nix and sudo's `secure_path` drops it, so
+/// privileged and remote Nix invocations use this directory. NixOS and
+/// nix-darwin both populate it.
+pub const NIX_BIN_PATH: &str = "/run/current-system/sw/bin";
+
+/// The type of system a node is running.
+///
+/// This determines how profiles are activated and which host
+/// tools are available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SystemType {
+    /// NixOS, activated with `switch-to-configuration`.
+    #[default]
+    NixOS,
+
+    /// macOS with nix-darwin, activated with `darwin-rebuild`.
+    Darwin,
+}
+
 /// A node's attribute name.
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, Eq, PartialEq)]
 #[serde(transparent)]
@@ -86,6 +108,10 @@ pub struct NodeConfig {
 
     #[validate(custom(function = "validate_keys"))]
     keys: HashMap<String, Key>,
+
+    // absent from colmenaHive outputs evaluated before darwin support
+    #[serde(rename = "systemType", default)]
+    system_type: SystemType,
 }
 
 #[derive(Debug, Clone, Validate, Deserialize)]
@@ -155,17 +181,24 @@ impl Deref for NodeName {
     }
 }
 
+impl std::fmt::Display for SystemType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NixOS => "nixos",
+            Self::Darwin => "darwin",
+        })
+    }
+}
+
 impl NodeConfig {
     pub fn tags(&self) -> &[String] {
         &self.tags
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn allows_local_deployment(&self) -> bool {
         self.allow_local_deployment
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn privilege_escalation_command(&self) -> &Vec<String> {
         &self.privilege_escalation_command
     }
@@ -177,11 +210,16 @@ impl NodeConfig {
         self.build_on_target = enable;
     }
 
+    pub fn system_type(&self) -> SystemType {
+        self.system_type
+    }
+
     pub fn to_ssh_host(&self, nix_flags: NixFlags) -> Option<Ssh> {
         self.target_host.as_ref().map(|target_host| {
             let mut host = Ssh::new(self.target_user.clone(), target_host.clone(), nix_flags);
             host.set_privilege_escalation_command(self.privilege_escalation_command.clone());
             host.set_extra_ssh_options(self.extra_ssh_options.clone());
+            host.set_system_type(self.system_type);
 
             if let Some(target_port) = self.target_port {
                 host.set_port(target_port);

@@ -2,6 +2,7 @@
 
 use super::*;
 
+use crate::nix::SystemType;
 use std::collections::HashSet;
 use std::fs;
 use std::hash::Hash;
@@ -756,4 +757,100 @@ fn test_user_builders_override_machines_file() {
             .any(|w| w == ["--option", "builders", "@/custom/machines"])
     );
     assert!(!argv.contains(&"@/etc/nix/machines".to_string()));
+}
+
+/// Builds a hive whose `meta.nix-darwin` stubs `darwinSystem` with the
+/// module system, type checking disabled. The stub tags the node so tests
+/// can tell which evaluator ran.
+fn darwin_hive_with(body: &str) -> String {
+    format!(
+        r#"
+      {{
+        meta.nix-darwin.lib.darwinSystem = {{ modules, specialArgs, ... }}:
+          (import <nixpkgs/lib>).evalModules {{
+            modules = modules ++ [ {{ _module.check = false; deployment.tags = [ "darwin-stub" ]; }} ];
+            inherit specialArgs;
+          }};
+        test = {body};
+      }}
+    "#
+    )
+}
+
+fn assert_darwin_evaluated(hive: &str) {
+    let hive = TempHive::new(hive);
+    let nodes = block_on(hive.deployment_info()).unwrap();
+    let test = &nodes[&node!("test")];
+
+    assert_eq!(SystemType::Darwin, test.system_type());
+    assert_eq!(["darwin-stub".to_string()], test.tags());
+}
+
+#[test]
+fn test_system_type_darwin_function() {
+    assert_darwin_evaluated(&darwin_hive_with(
+        r#"{ ... }: {
+          deployment.systemType = "darwin";
+        }"#,
+    ));
+}
+
+#[test]
+fn test_system_type_darwin_attrset() {
+    assert_darwin_evaluated(&darwin_hive_with(
+        r#"{
+          deployment.systemType = "darwin";
+        }"#,
+    ));
+}
+
+#[test]
+fn test_system_type_darwin_requires_nix_darwin() {
+    // without meta.nix-darwin the node would evaluate as NixOS
+    // that must fail instead of producing a NixOS profile
+    TempHive::invalid(
+        r#"
+      {
+        test = { ... }: {
+          deployment.systemType = "darwin";
+        };
+      }
+    "#,
+    );
+    TempHive::invalid(
+        r#"
+      {
+        test = {
+          deployment.systemType = "darwin";
+        };
+      }
+    "#,
+    );
+}
+
+#[test]
+fn test_system_type_probe_accepts_modules_path() {
+    // generated hardware-configuration.nix files import through modulesPath
+    TempHive::valid(&darwin_hive_with(
+        r#"{ modulesPath, ... }: {
+          imports = [ (modulesPath + "/profiles/minimal.nix") ];
+          boot.isContainer = true;
+        }"#,
+    ));
+}
+
+#[test]
+fn test_system_type_nixos_default() {
+    let hive = TempHive::new(
+        r#"
+      {
+        test = { ... }: {
+          boot.isContainer = true;
+        };
+      }
+    "#,
+    );
+    let nodes = block_on(hive.deployment_info()).unwrap();
+    let test = &nodes[&node!("test")];
+    assert_eq!(SystemType::NixOS, test.system_type());
 }

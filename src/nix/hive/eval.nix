@@ -16,7 +16,16 @@ let
     # containing configurations that will be applied to all
     # hosts.
     defaults = { };
+
+    # applied to darwin nodes after defaults
+    darwinDefaults = { };
   };
+
+  isDarwinFromFlake =
+    name:
+    rawFlake != null
+    && rawFlake.outputs ? darwinConfigurations
+    && rawFlake.outputs.darwinConfigurations ? ${name};
 
   uncheckedHive =
     let
@@ -147,18 +156,69 @@ let
   lib = nixpkgs.lib;
   reservedNames = [
     "defaults"
+    "darwinDefaults"
     "network"
     "meta"
   ];
 
-  evalNode =
+  mkSpecialArgs =
+    name:
+    {
+      inherit name;
+      nodes = uncheckedNodes;
+    }
+    // hive.meta.specialArgs
+    // (hive.meta.nodeSpecialArgs.${name} or { });
+
+  npkgsFor =
+    name:
+    if hasAttr name hive.meta.nodeNixpkgs then
+      mkNixpkgs "meta.nodeNixpkgs.${name}" hive.meta.nodeNixpkgs.${name}
+    else
+      nixpkgs;
+
+  # the evaluator is chosen by the node's own deployment.systemType, so the
+  # deployment options are evaluated alone first
+  # modulesPath is the NixOS one, darwin modules rarely import through it
+  probeSystemType =
     name: configs:
     let
-      npkgs =
-        if hasAttr name hive.meta.nodeNixpkgs then
-          mkNixpkgs "meta.nodeNixpkgs.${name}" hive.meta.nodeNixpkgs.${name}
-        else
-          nixpkgs;
+      npkgs = npkgsFor name;
+    in
+    (lib.evalModules {
+      modules = [
+        colmenaOptions.deploymentOptions
+        {
+          _module.check = false;
+          _module.args.pkgs = npkgs;
+        }
+        hive.defaults
+      ]
+      ++ configs;
+      specialArgs = mkSpecialArgs name // {
+        modulesPath = toString (npkgs.path + "/nixos/modules");
+      };
+    }).config.deployment.systemType;
+
+  # hives without meta.nix-darwin never run the probe
+  systemTypeOf =
+    name: configs:
+    let
+      explicit = if hive.meta.nix-darwin == null then null else probeSystemType name configs;
+    in
+    if explicit != null then
+      explicit
+    else if isDarwinFromFlake name then
+      "darwin"
+    else
+      "nixos";
+
+  nodeSystemTypes = lib.genAttrs nodeNames (name: systemTypeOf name (configsFor name));
+
+  evalNixOSNode =
+    name: configs:
+    let
+      npkgs = npkgsFor name;
       evalConfig = import (npkgs.path + "/nixos/lib/eval-config.nix");
 
       # Here we need to merge the configurations in meta.nixpkgs
@@ -203,13 +263,57 @@ let
         hive.defaults
       ]
       ++ configs;
-      specialArgs = {
-        inherit name;
-        nodes = uncheckedNodes;
-      }
-      // hive.meta.specialArgs
-      // (hive.meta.nodeSpecialArgs.${name} or { });
+      specialArgs = mkSpecialArgs name;
     };
+
+  evalDarwinNode =
+    name: configs:
+    let
+      npkgs = npkgsFor name;
+
+      darwinSystem =
+        hive.meta.nix-darwin.lib.darwinSystem
+          or (throw "meta.nix-darwin must be the nix-darwin flake input to evaluate ${name}");
+
+      nixpkgsModule =
+        { lib, ... }:
+        {
+          nixpkgs.overlays = lib.mkBefore npkgs.overlays;
+          nixpkgs.config = lib.mkBefore npkgs.config;
+        };
+    in
+    darwinSystem {
+      inherit (npkgs.stdenv.hostPlatform) system;
+
+      modules = [
+        nixpkgsModule
+        colmenaModules.assertionModule
+        colmenaOptions.deploymentOptions
+        hive.defaults
+        hive.darwinDefaults
+      ]
+      ++ configs;
+      specialArgs = mkSpecialArgs name;
+    };
+
+  evalNode =
+    name: configs:
+    let
+      type = nodeSystemTypes.${name};
+      typeModule = {
+        deployment.systemType = lib.mkDefault type;
+      };
+      node =
+        if type == "darwin" then
+          evalDarwinNode name (configs ++ [ typeModule ])
+        else
+          evalNixOSNode name (configs ++ [ typeModule ]);
+      declared = node.config.deployment.systemType;
+    in
+    if declared != type then
+      throw "Node ${name} declares deployment.systemType = \"${declared}\" and was evaluated as ${type}. Set meta.nix-darwin so the option is read before evaluation."
+    else
+      node;
 
   nodeNames = filter (name: !elem name reservedNames) (attrNames hive);
 
