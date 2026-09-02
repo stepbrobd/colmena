@@ -12,9 +12,6 @@ jobs:
           - label: aarch64-linux
             image: ubuntu-latest
             system: aarch64-linux
-          - label: x86_64-darwin
-            image: macos-latest
-            system: x86_64-darwin
           - label: aarch64-darwin
             image: macos-latest
             system: aarch64-darwin

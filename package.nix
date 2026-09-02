@@ -67,7 +67,7 @@ rustPlatform.buildRustPackage rec {
     homepage = "https://colmena.cli.rs/${passthru.apiVersion}";
     license = licenses.mit;
     maintainers = with maintainers; [ zhaofengli ];
-    platforms = platforms.linux ++ platforms.darwin;
+    platforms = platforms.linux ++ [ "aarch64-darwin" ];
     mainProgram = "colmena";
   };
 }
