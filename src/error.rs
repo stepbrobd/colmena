@@ -2,6 +2,7 @@
 
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
+use std::time::Duration;
 
 use snafu::{Backtrace, Snafu};
 use validator::ValidationErrors;
@@ -57,6 +58,43 @@ pub enum ColmenaError {
 
     #[snafu(display("Could not determine current profile"))]
     FailedToGetCurrentProfile,
+
+    #[snafu(display(
+        "Could not reach activation unit {} on host {} for {}s, last error: {}",
+        unit,
+        hostname,
+        timeout.as_secs(),
+        source
+    ))]
+    ActivationUnreachable {
+        hostname: String,
+        unit: String,
+        timeout: Duration,
+        source: Box<ColmenaError>,
+    },
+
+    #[snafu(display(
+        "Activation unit {} on host {} does not exist. SSH may have dropped before systemd-run ran",
+        unit,
+        hostname
+    ))]
+    ActivationUnitNotFound { hostname: String, unit: String },
+
+    #[snafu(display(
+        "Activation unit {} on host {} failed with result {}{}",
+        unit,
+        hostname,
+        result,
+        exit_status
+            .map(|status| format!(" and exit status {}", status))
+            .unwrap_or_default()
+    ))]
+    ActivationFailed {
+        hostname: String,
+        unit: String,
+        result: String,
+        exit_status: Option<i32>,
+    },
 
     #[snafu(display("Don't know how to connect to the node"))]
     NoTargetHost,

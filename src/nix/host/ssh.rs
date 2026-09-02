@@ -8,7 +8,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use shell_escape::unix::escape;
 use tokio::process::Command;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
+use uuid::Uuid;
 
 use super::{CopyDirection, CopyOptions, Host, MAIN_PROFILE_SCRIPT, RebootOptions, key_uploader};
 use crate::error::{ColmenaError, ColmenaResult};
@@ -17,6 +18,15 @@ use crate::nix::{
     CURRENT_PROFILE, Goal, Key, NIX_BIN_PATH, NixCommand, NixFlags, Profile, StorePath, SystemType,
 };
 use crate::util::{CommandExecution, CommandExt};
+
+const ACTIVATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How long the host may stay unreachable while an activation unit runs.
+///
+/// A network restart during activation drops the SSH session for a few
+/// seconds. Without a bound, a host that went down during activation
+/// would be polled forever.
+const ACTIVATION_RECONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A remote machine connected over SSH.
 #[derive(Debug)]
@@ -54,6 +64,87 @@ pub struct Ssh {
 /// An opaque boot ID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BootId(String);
+
+/// The outcome of polling a transient activation unit.
+#[derive(Debug, PartialEq, Eq)]
+enum ActivationState {
+    Running,
+    Succeeded,
+    NotFound,
+    Failed {
+        result: String,
+        exit_status: Option<i32>,
+    },
+}
+
+/// The properties of a transient activation unit from `systemctl show`.
+#[derive(Debug, PartialEq, Eq)]
+struct ActivationStatus {
+    load_state: String,
+    active_state: String,
+    sub_state: String,
+    result: String,
+    exec_main_status: Option<i32>,
+}
+
+impl ActivationStatus {
+    fn from_systemctl_show(output: &str) -> ColmenaResult<Self> {
+        let bad_output = || ColmenaError::BadOutput {
+            output: output.to_string(),
+        };
+
+        let mut properties = HashMap::new();
+        for line in output.lines().filter(|line| !line.is_empty()) {
+            let (key, value) = line.split_once('=').ok_or_else(bad_output)?;
+            properties.insert(key, value);
+        }
+
+        let property = |key: &str| {
+            properties
+                .get(key)
+                .map(|value| value.to_string())
+                .ok_or_else(bad_output)
+        };
+
+        let exec_main_status = match properties.get("ExecMainStatus") {
+            None | Some(&"") => None,
+            Some(value) => Some(value.parse().map_err(|_| bad_output())?),
+        };
+
+        Ok(Self {
+            load_state: property("LoadState")?,
+            active_state: property("ActiveState")?,
+            sub_state: property("SubState")?,
+            result: property("Result")?,
+            exec_main_status,
+        })
+    }
+
+    /// Maps the unit properties to an outcome.
+    ///
+    /// A unit stopped by an operator reports success like a completed one.
+    fn state(&self) -> ActivationState {
+        if self.load_state == "not-found" {
+            return ActivationState::NotFound;
+        }
+
+        // RemainAfterExit=yes keeps the unit active after the process exits
+        // SubState=exited tells that apart from a running process
+        let running = matches!(self.active_state.as_str(), "activating" | "deactivating")
+            || (self.active_state == "active" && self.sub_state != "exited");
+
+        if running {
+            ActivationState::Running
+        } else if self.result == "success" {
+            ActivationState::Succeeded
+        } else {
+            ActivationState::Failed {
+                result: self.result.clone(),
+                exit_status: self.exec_main_status,
+            }
+        }
+    }
+}
 
 #[async_trait]
 impl Host for Ssh {
@@ -112,6 +203,12 @@ impl Host for Ssh {
                 .into_argv();
             let set_profile = self.ssh_argv(argv);
             self.run_command(set_profile).await?;
+        }
+
+        // switch and test may restart the network and drop the session
+        // nix-darwin has no systemd to detach into
+        if self.system_type == SystemType::NixOS && matches!(goal, Goal::Switch | Goal::Test) {
+            return self.activate_detached(&activation_command).await;
         }
 
         let command = self.ssh(&activation_command);
@@ -283,6 +380,13 @@ impl Ssh {
         execution.run().await
     }
 
+    fn message(&self, message: String) -> ColmenaResult<()> {
+        match &self.job {
+            Some(job) => job.message(message),
+            None => Ok(()),
+        }
+    }
+
     fn ssh_target(&self) -> String {
         match &self.user {
             Some(n) => format!("{}@{}", n, self.host),
@@ -449,6 +553,171 @@ impl Ssh {
             }
         }
     }
+
+    /// Runs the activation in a transient systemd unit and polls it, so
+    /// that the activation completes even when it drops the SSH session.
+    ///
+    /// A failed unit stays on the host for `systemctl status` and
+    /// `journalctl -u`. An interrupted poll leaves a finished unit behind
+    /// until `systemctl stop`.
+    async fn activate_detached(&mut self, activation_command: &[String]) -> ColmenaResult<()> {
+        let unit = format!("colmena-activate-{}", Uuid::new_v4().simple());
+        self.message(format!("Starting activation in unit {unit}"))?;
+
+        match self.start_activation_unit(&unit, activation_command).await {
+            Err(error) if Self::is_connection_loss(&error) => {
+                self.message(
+                    "SSH session dropped while starting the activation, reconnecting".to_string(),
+                )?;
+            }
+            result => result?,
+        }
+
+        let mut deadline: Option<Instant> = None;
+
+        loop {
+            let status = match self.get_activation_status(&unit).await {
+                Ok(status) => status,
+                Err(error) if Self::is_retryable(&error) => {
+                    if deadline.is_none() {
+                        self.message(format!(
+                            "Lost contact with host, retrying for up to {}s",
+                            ACTIVATION_RECONNECT_TIMEOUT.as_secs()
+                        ))?;
+                    }
+
+                    let until = *deadline
+                        .get_or_insert_with(|| Instant::now() + ACTIVATION_RECONNECT_TIMEOUT);
+                    if Instant::now() > until {
+                        return Err(ColmenaError::ActivationUnreachable {
+                            hostname: self.host.clone(),
+                            unit,
+                            timeout: ACTIVATION_RECONNECT_TIMEOUT,
+                            source: Box::new(error),
+                        });
+                    }
+
+                    sleep(ACTIVATION_POLL_INTERVAL).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            deadline = None;
+
+            match status.state() {
+                ActivationState::Running => sleep(ACTIVATION_POLL_INTERVAL).await,
+                ActivationState::Succeeded => {
+                    self.cleanup_activation_unit(&unit).await;
+                    return Ok(());
+                }
+                ActivationState::NotFound => {
+                    return Err(ColmenaError::ActivationUnitNotFound {
+                        hostname: self.host.clone(),
+                        unit,
+                    });
+                }
+                ActivationState::Failed {
+                    result,
+                    exit_status,
+                } => {
+                    if let Err(error) = self.emit_activation_logs(&unit).await {
+                        self.message(format!(
+                            "Could not read the journal of unit {unit}: {error}"
+                        ))?;
+                    }
+
+                    return Err(ColmenaError::ActivationFailed {
+                        hostname: self.host.clone(),
+                        unit,
+                        result,
+                        exit_status,
+                    });
+                }
+            }
+        }
+    }
+
+    async fn start_activation_unit(
+        &mut self,
+        unit: &str,
+        activation_command: &[String],
+    ) -> ColmenaResult<()> {
+        let mut command = vec![
+            "systemd-run".to_string(),
+            format!("--unit={unit}"),
+            "--service-type=exec".to_string(),
+            // keeps the exit status around for the poll
+            "--property=RemainAfterExit=yes".to_string(),
+            "--quiet".to_string(),
+            "--".to_string(),
+        ];
+        command.extend_from_slice(activation_command);
+
+        let command = self.ssh_argv(command);
+        self.run_command(command).await
+    }
+
+    async fn get_activation_status(&mut self, unit: &str) -> ColmenaResult<ActivationStatus> {
+        let output = self
+            .ssh(&[
+                "systemctl",
+                "show",
+                "--property=LoadState,ActiveState,SubState,Result,ExecMainStatus",
+                unit,
+            ])
+            .capture_output()
+            .await?;
+
+        ActivationStatus::from_systemctl_show(&output)
+    }
+
+    /// Emits the last journal lines of a failed activation unit.
+    async fn emit_activation_logs(&mut self, unit: &str) -> ColmenaResult<()> {
+        let output = self
+            .ssh(&[
+                "journalctl",
+                "-u",
+                unit,
+                "-n",
+                "20",
+                "--no-pager",
+                "-o",
+                "cat",
+            ])
+            .capture_output()
+            .await?;
+
+        if let Some(job) = &self.job {
+            for line in output.lines() {
+                job.stderr(line.to_string())?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Stops a finished unit, which releases the RemainAfterExit hold so
+    /// that systemd garbage collects it. A failed stop is ignored, since
+    /// the unit is only a leftover.
+    async fn cleanup_activation_unit(&mut self, unit: &str) {
+        let _ = self
+            .ssh(&["systemctl", "stop", unit])
+            .capture_output()
+            .await;
+    }
+
+    fn is_connection_loss(error: &ColmenaError) -> bool {
+        matches!(error, ColmenaError::ChildFailure { exit_code: 255, .. })
+    }
+
+    /// Whether a failed poll may be a lost connection or a restarting
+    /// systemd rather than a failed activation.
+    fn is_retryable(error: &ColmenaError) -> bool {
+        matches!(
+            error,
+            ColmenaError::ChildFailure { .. } | ColmenaError::ChildKilled { .. }
+        )
+    }
 }
 
 #[cfg(test)]
@@ -562,5 +831,88 @@ mod tests {
             host.nix_copy_closure(&store_path, CopyDirection::ToRemote, CopyOptions::default());
 
         assert_eq!(command.as_std().get_program(), "nix");
+    }
+
+    #[test]
+    fn test_activation_status_parses_successful_unit() {
+        // completed and kept active/exited by RemainAfterExit=yes
+        let status = ActivationStatus::from_systemctl_show(
+            "LoadState=loaded\nActiveState=active\nSubState=exited\nResult=success\nExecMainStatus=0\n",
+        )
+        .unwrap();
+
+        assert_eq!(ActivationState::Succeeded, status.state());
+    }
+
+    #[test]
+    fn test_activation_status_parses_inactive_success() {
+        let status = ActivationStatus::from_systemctl_show(
+            "LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=success\nExecMainStatus=0\n",
+        )
+        .unwrap();
+
+        assert_eq!(ActivationState::Succeeded, status.state());
+    }
+
+    #[test]
+    fn test_activation_status_parses_activating_unit() {
+        let status = ActivationStatus::from_systemctl_show(
+            "LoadState=loaded\nActiveState=activating\nSubState=start\nResult=success\nExecMainStatus=0\n",
+        )
+        .unwrap();
+
+        assert_eq!(ActivationState::Running, status.state());
+    }
+
+    #[test]
+    fn test_activation_status_parses_active_running_unit() {
+        let status = ActivationStatus::from_systemctl_show(
+            "LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nExecMainStatus=0\n",
+        )
+        .unwrap();
+
+        assert_eq!(ActivationState::Running, status.state());
+    }
+
+    #[test]
+    fn test_activation_status_parses_not_found_unit() {
+        let status = ActivationStatus::from_systemctl_show(
+            "LoadState=not-found\nActiveState=inactive\nSubState=dead\nResult=success\nExecMainStatus=0\n",
+        )
+        .unwrap();
+
+        assert_eq!(ActivationState::NotFound, status.state());
+    }
+
+    #[test]
+    fn test_activation_status_handles_trailing_blank_line() {
+        let status = ActivationStatus::from_systemctl_show(
+            "LoadState=loaded\nActiveState=active\nSubState=exited\nResult=success\nExecMainStatus=0\n\n",
+        )
+        .unwrap();
+
+        assert_eq!(ActivationState::Succeeded, status.state());
+    }
+
+    #[test]
+    fn test_activation_status_parses_failed_unit() {
+        let status = ActivationStatus::from_systemctl_show(
+            "LoadState=loaded\nActiveState=failed\nSubState=failed\nResult=exit-code\nExecMainStatus=1\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            ActivationState::Failed {
+                result: "exit-code".to_string(),
+                exit_status: Some(1),
+            },
+            status.state()
+        );
+    }
+
+    #[test]
+    fn test_activation_status_rejects_missing_property() {
+        assert!(ActivationStatus::from_systemctl_show("LoadState=loaded\n").is_err());
+        assert!(ActivationStatus::from_systemctl_show("garbage").is_err());
     }
 }
