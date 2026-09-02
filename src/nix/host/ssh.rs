@@ -146,6 +146,26 @@ impl ActivationStatus {
     }
 }
 
+/// Splits `journalctl --show-cursor` output into log lines and the cursor.
+///
+/// The footer `-- cursor: <cursor>` follows the entries. The marker
+/// `-- No entries --` replaces them when nothing matched. Neither is a
+/// log line.
+fn parse_journal_output(output: &str) -> (Vec<&str>, Option<&str>) {
+    let mut lines = Vec::new();
+    let mut cursor = None;
+
+    for line in output.lines() {
+        if let Some(c) = line.strip_prefix("-- cursor: ") {
+            cursor = Some(c.trim());
+        } else if line != "-- No entries --" {
+            lines.push(line);
+        }
+    }
+
+    (lines, cursor)
+}
+
 #[async_trait]
 impl Host for Ssh {
     async fn copy_closure(
@@ -574,6 +594,8 @@ impl Ssh {
         }
 
         let mut deadline: Option<Instant> = None;
+        let mut cursor: Option<String> = None;
+        let mut journal_failed = false;
 
         loop {
             let status = match self.get_activation_status(&unit).await {
@@ -604,6 +626,18 @@ impl Ssh {
             };
             deadline = None;
 
+            // the journal is display only, its first failure is reported once
+            match self.fetch_activation_logs(&unit, cursor.as_deref()).await {
+                Ok(next) => cursor = next,
+                Err(error) if !journal_failed => {
+                    journal_failed = true;
+                    self.message(format!(
+                        "Could not read the journal of unit {unit}: {error}"
+                    ))?;
+                }
+                Err(_) => {}
+            }
+
             match status.state() {
                 ActivationState::Running => sleep(ACTIVATION_POLL_INTERVAL).await,
                 ActivationState::Succeeded => {
@@ -620,12 +654,6 @@ impl Ssh {
                     result,
                     exit_status,
                 } => {
-                    if let Err(error) = self.emit_activation_logs(&unit).await {
-                        self.message(format!(
-                            "Could not read the journal of unit {unit}: {error}"
-                        ))?;
-                    }
-
                     return Err(ColmenaError::ActivationFailed {
                         hostname: self.host.clone(),
                         unit,
@@ -671,29 +699,38 @@ impl Ssh {
         ActivationStatus::from_systemctl_show(&output)
     }
 
-    /// Emits the last journal lines of a failed activation unit.
-    async fn emit_activation_logs(&mut self, unit: &str) -> ColmenaResult<()> {
-        let output = self
-            .ssh(&[
-                "journalctl",
-                "-u",
-                unit,
-                "-n",
-                "20",
-                "--no-pager",
-                "-o",
-                "cat",
-            ])
-            .capture_output()
-            .await?;
+    /// Emits the journal lines of an activation unit since `cursor` and
+    /// returns the cursor to resume from.
+    async fn fetch_activation_logs(
+        &mut self,
+        unit: &str,
+        cursor: Option<&str>,
+    ) -> ColmenaResult<Option<String>> {
+        let mut command = vec![
+            "journalctl".to_string(),
+            "-u".to_string(),
+            unit.to_string(),
+            "-o".to_string(),
+            "cat".to_string(),
+            "--no-pager".to_string(),
+            "--show-cursor".to_string(),
+        ];
+
+        if let Some(cursor) = cursor {
+            command.push(format!("--after-cursor={cursor}"));
+        }
+
+        // cursors contain semicolons, which the remote shell reads as command separators
+        let output = self.ssh_argv(command).capture_output().await?;
+        let (lines, next) = parse_journal_output(&output);
 
         if let Some(job) = &self.job {
-            for line in output.lines() {
+            for line in lines {
                 job.stderr(line.to_string())?;
             }
         }
 
-        Ok(())
+        Ok(next.or(cursor).map(str::to_owned))
     }
 
     /// Stops a finished unit, which releases the RemainAfterExit hold so
@@ -914,5 +951,41 @@ mod tests {
     fn test_activation_status_rejects_missing_property() {
         assert!(ActivationStatus::from_systemctl_show("LoadState=loaded\n").is_err());
         assert!(ActivationStatus::from_systemctl_show("garbage").is_err());
+    }
+
+    #[test]
+    fn test_parse_journal_output_entries_and_cursor() {
+        let output = "starting systemd-nspawn\nactivation finished\n-- cursor: s=abc123;i=1f4;b=deadbeef;m=0;t=5;x=9\n";
+        let (lines, cursor) = parse_journal_output(output);
+
+        assert_eq!(
+            vec!["starting systemd-nspawn", "activation finished"],
+            lines
+        );
+        assert_eq!(Some("s=abc123;i=1f4;b=deadbeef;m=0;t=5;x=9"), cursor);
+    }
+
+    #[test]
+    fn test_parse_journal_output_no_entries() {
+        let (lines, cursor) = parse_journal_output("-- No entries --\n");
+
+        assert!(lines.is_empty());
+        assert_eq!(None, cursor);
+    }
+
+    #[test]
+    fn test_parse_journal_output_without_footer() {
+        let (lines, cursor) = parse_journal_output("a line without any footer\n");
+
+        assert_eq!(vec!["a line without any footer"], lines);
+        assert_eq!(None, cursor);
+    }
+
+    #[test]
+    fn test_parse_journal_output_empty() {
+        let (lines, cursor) = parse_journal_output("");
+
+        assert!(lines.is_empty());
+        assert_eq!(None, cursor);
     }
 }
