@@ -128,7 +128,10 @@ struct Opts {
 
     /// Passes an arbitrary option to Nix commands
     ///
-    /// This only works when building locally.
+    /// Applies to every Nix invocation Colmena makes, on this machine and on
+    /// deployment targets. A value naming a local path, such as
+    /// extra-builtins-file, is passed to the targets unchanged, where the
+    /// path may not exist.
     #[arg(
         long,
         global = true,

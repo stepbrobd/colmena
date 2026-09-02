@@ -265,10 +265,13 @@ impl Hive {
 
         let mut targets = HashMap::new();
         let mut n_ssh = 0;
+
+        let nix_flags = self.base_flags();
+
         for node in selected_nodes.into_iter() {
             let config = node_configs.remove(&node).unwrap();
 
-            let host = config.to_ssh_host().map(|mut host| {
+            let host = config.to_ssh_host(nix_flags.clone()).map(|mut host| {
                 n_ssh += 1;
 
                 if let Some(ssh_config) = &ssh_config {
