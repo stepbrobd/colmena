@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::Host;
+use super::{Host, NixCommand, NixFlags};
 use crate::error::{ColmenaError, ColmenaResult};
 
 /// A Nix store path.
@@ -39,6 +39,13 @@ impl StorePath {
         } else {
             false
         }
+    }
+
+    /// Returns the `nix-store --realise` command for this path.
+    pub fn realise_command(&self, flags: &NixFlags) -> NixCommand {
+        NixCommand::nix_store(flags.clone())
+            .args(["--no-gc-warning", "--realise"])
+            .arg(self.as_path())
     }
 
     /// Converts the store path into a store derivation.
