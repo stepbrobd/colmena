@@ -2,7 +2,6 @@
   lib,
   stdenv,
   rustPlatform,
-  nix-gitignore,
   installShellFiles,
   nix-eval-jobs,
 }:
