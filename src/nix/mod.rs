@@ -12,6 +12,7 @@ use crate::error::{ColmenaError, ColmenaResult};
 // TODO: drop the allow once every call site uses NixCommand
 #[allow(dead_code)]
 pub mod command;
+pub use command::NixCommand;
 
 pub mod host;
 use host::Ssh;
@@ -206,20 +207,12 @@ impl NixFlags {
         self.impure = impure;
     }
 
-    pub fn set_options(&mut self, options: HashMap<String, String>) {
-        self.options = options.into_iter().collect();
-    }
-
     pub fn add_option(&mut self, name: String, value: String) {
         self.options.insert(name, value);
     }
 
     pub fn has_option(&self, name: &str) -> bool {
         self.options.contains_key(name)
-    }
-
-    pub fn to_args(&self) -> Vec<String> {
-        self.to_args_inner(false)
     }
 
     /// Returns arguments for `nix-store`.

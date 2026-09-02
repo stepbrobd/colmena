@@ -1,8 +1,10 @@
 use std::fmt;
-use std::process::Stdio;
+use std::io;
+use std::process::{ExitStatus, Output, Stdio};
 
 use regex::Regex;
-use tokio::process::Command;
+
+use super::{NixCommand, NixFlags};
 
 pub struct NixVersion {
     major: usize,
@@ -42,6 +44,28 @@ impl fmt::Display for NixVersion {
     }
 }
 
+/// Runs `nix-instantiate --version` without the user flags, so a bad
+/// `--option` cannot hide the installed version.
+async fn probe_version() -> io::Result<Output> {
+    NixCommand::nix_instantiate(NixFlags::default())
+        .arg("--version")
+        .build()
+        .output()
+        .await
+}
+
+/// Evaluates `builtins.getFlake` with the user flags, so flakes enabled
+/// through `--nix-option experimental-features` count as enabled.
+async fn probe_flakes(flags: &NixFlags) -> io::Result<ExitStatus> {
+    NixCommand::nix_instantiate(flags.clone())
+        .args(["--eval", "-E", "builtins.getFlake"])
+        .build()
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+}
+
 pub struct NixCheck {
     version: Option<NixVersion>,
     flakes_enabled: bool,
@@ -53,35 +77,18 @@ impl NixCheck {
         flakes_enabled: false,
     };
 
-    pub async fn detect() -> Self {
-        let version_cmd = Command::new("nix-instantiate")
-            .arg("--version")
-            .output()
-            .await;
+    pub async fn detect(flags: &NixFlags) -> Self {
+        let (version, flakes) = tokio::join!(probe_version(), probe_flakes(flags));
 
-        if version_cmd.is_err() {
+        let (Ok(version), Ok(flakes)) = (version, flakes) else {
             return Self::NO_NIX;
-        }
+        };
 
-        let version =
-            NixVersion::parse(String::from_utf8_lossy(&version_cmd.unwrap().stdout).to_string());
-
-        let flake_cmd = Command::new("nix-instantiate")
-            .args(["--eval", "-E", "builtins.getFlake"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-
-        if flake_cmd.is_err() {
-            return Self::NO_NIX;
-        }
-
-        let flakes_enabled = flake_cmd.unwrap().success();
+        let version = NixVersion::parse(String::from_utf8_lossy(&version.stdout).to_string());
 
         Self {
             version: Some(version),
-            flakes_enabled,
+            flakes_enabled: flakes.success(),
         }
     }
 

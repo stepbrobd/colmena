@@ -11,7 +11,7 @@ use tracing_subscriber::EnvFilter;
 use crate::{
     command::{self, apply::DeployOpts},
     error::{ColmenaError, ColmenaResult},
-    nix::{Hive, HivePath, hive::EvaluationMethod},
+    nix::{Hive, HivePath, NixFlags, hive::EvaluationMethod},
 };
 
 /// Base URL of the manual, without the trailing slash.
@@ -112,7 +112,7 @@ struct Opts {
         display_order = HELP_ORDER_FIRST,
         global = true,
     )]
-    config: Option<HivePath>,
+    config: Option<String>,
 
     /// Show debug information for Nix commands
     ///
@@ -222,9 +222,25 @@ enum Command {
     },
 }
 
-async fn get_hive(opts: &Opts) -> ColmenaResult<Hive> {
+/// Builds the Nix flags from the CLI options.
+fn get_nix_flags(opts: &Opts) -> NixFlags {
+    let mut flags = NixFlags::default();
+    flags.set_show_trace(opts.show_trace);
+    flags.set_impure(opts.impure);
+
+    for chunks in opts.nix_option.chunks_exact(2) {
+        let [name, value] = chunks else {
+            unreachable!()
+        };
+        flags.add_option(name.clone(), value.clone());
+    }
+
+    flags
+}
+
+async fn get_hive(opts: &Opts, flags: NixFlags) -> ColmenaResult<Hive> {
     let path = match &opts.config {
-        Some(path) => path.clone(),
+        Some(config) => HivePath::resolve(config, &flags).await?,
         None => {
             // traverse upwards until we find hive.nix
             let mut cur = std::env::current_dir()?;
@@ -260,7 +276,7 @@ async fn get_hive(opts: &Opts) -> ColmenaResult<Hive> {
                 );
             }
 
-            HivePath::from_path(file_path.unwrap()).await?
+            HivePath::from_path(file_path.unwrap(), &flags).await?
         }
     };
 
@@ -273,15 +289,7 @@ async fn get_hive(opts: &Opts) -> ColmenaResult<Hive> {
         }
     }
 
-    let mut hive = Hive::new(path).await?;
-
-    if opts.show_trace {
-        hive.set_show_trace(true);
-    }
-
-    if opts.impure {
-        hive.set_impure(true);
-    }
+    let mut hive = Hive::new(path, flags).await?;
 
     if opts.deprecated_experimental_flake_eval_flag {
         tracing::error!(
@@ -303,13 +311,6 @@ async fn get_hive(opts: &Opts) -> ColmenaResult<Hive> {
         hive.set_evaluation_method(EvaluationMethod::NixInstantiate);
     }
 
-    for chunks in opts.nix_option.chunks_exact(2) {
-        let [name, value] = chunks else {
-            unreachable!()
-        };
-        hive.add_nix_option(name.clone(), value.clone());
-    }
-
     Ok(hive)
 }
 
@@ -324,7 +325,11 @@ pub async fn run() {
         return;
     }
 
-    let hive = get_hive(&opts).await.expect("Failed to get flake or hive");
+    let flags = get_nix_flags(&opts);
+
+    let hive = get_hive(&opts, flags.clone())
+        .await
+        .expect("Failed to get flake or hive");
 
     use crate::troubleshooter::run_wrapped as r;
 
@@ -334,7 +339,7 @@ pub async fn run() {
         Command::ApplyLocal(args) => r(command::apply_local::run(hive, args)).await,
         Command::Eval(args) => r(command::eval::run(hive, args)).await,
         Command::Exec(args) => r(command::exec::run(hive, args)).await,
-        Command::NixInfo => r(command::nix_info::run()).await,
+        Command::NixInfo => r(command::nix_info::run(flags)).await,
         Command::Repl => r(command::repl::run(hive)).await,
         #[cfg(debug_assertions)]
         Command::TestProgress => r(command::test_progress::run()).await,

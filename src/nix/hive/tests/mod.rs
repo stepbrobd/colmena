@@ -37,11 +37,15 @@ struct TempHive {
 
 impl TempHive {
     pub fn new(text: &str) -> Self {
+        Self::with_flags(text, NixFlags::default())
+    }
+
+    pub fn with_flags(text: &str, flags: NixFlags) -> Self {
         let mut temp_file = NamedTempFile::new().unwrap();
         temp_file.write_all(text.as_bytes()).unwrap();
 
-        let hive_path = block_on(HivePath::from_path(temp_file.path())).unwrap();
-        let hive = block_on(Hive::new(hive_path)).unwrap();
+        let hive_path = block_on(HivePath::from_path(temp_file.path(), &flags)).unwrap();
+        let hive = block_on(Hive::new(hive_path, flags)).unwrap();
 
         Self {
             hive,
@@ -53,8 +57,10 @@ impl TempHive {
     ///
     /// Note that this _does not_ attempt to evaluate `config.toplevel`.
     pub fn valid(text: &str) {
-        let mut hive = Self::new(text);
-        hive.hive.set_show_trace(true);
+        let mut flags = NixFlags::default();
+        flags.set_show_trace(true);
+
+        let hive = Self::with_flags(text, flags);
         assert!(block_on(hive.deployment_info()).is_ok());
     }
 
@@ -187,12 +193,13 @@ fn test_parse_makehive_flake() {
     fs::write(flake_nix, patched_flake).unwrap();
 
     // run the test
-    let flake = block_on(Flake::from_dir(flake_dir.as_ref())).unwrap();
+    let flake = block_on(Flake::from_dir(flake_dir.as_ref(), &NixFlags::default())).unwrap();
+
+    let mut flags = NixFlags::default();
+    flags.set_show_trace(true);
 
     let hive_path = HivePath::Flake(flake);
-    let mut hive = block_on(Hive::new(hive_path)).unwrap();
-
-    hive.set_show_trace(true);
+    let mut hive = block_on(Hive::new(hive_path, flags)).unwrap();
 
     let nodes = block_on(hive.deployment_info()).unwrap();
     assert!(set_eq(
@@ -700,4 +707,27 @@ fn test_hive_get_meta() {
     eprintln!("{:?}", eval);
 
     assert!(!eval.allow_apply_all);
+}
+
+#[test]
+fn test_user_builders_override_machines_file() {
+    let mut flags = NixFlags::default();
+    flags.add_option("builders".to_string(), "@/custom/machines".to_string());
+
+    let hive = TempHive::with_flags(
+        r#"
+      {
+        meta.machinesFile = "/etc/nix/machines";
+      }
+    "#,
+        flags,
+    );
+
+    let with_builders = block_on(hive.nix_flags_with_builders()).unwrap();
+    let argv = NixCommand::nix_store(with_builders).into_argv();
+    assert!(
+        argv.windows(3)
+            .any(|w| w == ["--option", "builders", "@/custom/machines"])
+    );
+    assert!(!argv.contains(&"@/etc/nix/machines".to_string()));
 }
