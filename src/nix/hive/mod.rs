@@ -239,8 +239,11 @@ impl Hive {
     pub async fn nix_flags_with_builders(&self) -> ColmenaResult<NixFlags> {
         let mut flags = self.nix_flags();
 
-        if let Some(machines_file) = &self.get_meta_config().await?.machines_file {
-            flags.set_builders(Some(format!("@{}", machines_file)));
+        // an explicit --nix-option builders overrides meta.machinesFile
+        if let Some(machines_file) = &self.get_meta_config().await?.machines_file
+            && !flags.has_option("builders")
+        {
+            flags.add_option("builders".to_string(), format!("@{}", machines_file));
         }
 
         Ok(flags)
