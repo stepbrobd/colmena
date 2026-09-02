@@ -327,9 +327,13 @@ pub async fn run() {
 
     let flags = get_nix_flags(&opts);
 
-    let hive = get_hive(&opts, flags.clone())
-        .await
-        .expect("Failed to get flake or hive");
+    let hive = match get_hive(&opts, flags.clone()).await {
+        Ok(hive) => hive,
+        Err(error) => {
+            tracing::error!("Failed to load the hive: {}", error);
+            quit::with_code(2);
+        }
+    };
 
     use crate::troubleshooter::run_wrapped as r;
 
