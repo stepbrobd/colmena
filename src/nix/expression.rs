@@ -43,7 +43,7 @@ impl SerializedNixExpression {
 
 impl NixExpression for SerializedNixExpression {
     fn expression(&self) -> String {
-        format!("(builtins.fromJSON {})", &self.0)
+        format!("(builtins.fromJSON {})", self.0)
     }
 }
 
