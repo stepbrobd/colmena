@@ -8,3 +8,4 @@ This section introduces the main features in Colmena:
 - **[Ad Hoc Evaluation](eval.md)** - Evaluating a Nix expression with access to your configuration
 - **[Parallelism](parallelism.md)** - Controlling how Colmena parallelizes the deployment process
 - **[Remote Builds](remote-builds.md)** - Building system profiles on remote machines
+- **[macOS with nix-darwin](nix-darwin.md)** - Deploying to macOS machines managed by nix-darwin

@@ -11,6 +11,7 @@
     - [Ad Hoc Evaluation](./features/eval.md)
     - [Parallelism](./features/parallelism.md)
     - [Remote Builds](./features/remote-builds.md)
+    - [macOS with nix-darwin](./features/nix-darwin.md)
 - [Examples](./examples/index.md)
     - [Multi-Architecture Deployments](./examples/multi-arch.md)
 - [Reference](./reference/index.md)
