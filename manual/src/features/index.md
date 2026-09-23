@@ -9,3 +9,4 @@ This section introduces the main features in Colmena:
 - **[Parallelism](parallelism.md)** - Controlling how Colmena parallelizes the deployment process
 - **[Remote Builds](remote-builds.md)** - Building system profiles on remote machines
 - **[macOS with nix-darwin](nix-darwin.md)** - Deploying to macOS machines managed by nix-darwin
+- **[Detached Activation](detached-activation.md)** - Keeping activations alive when they drop the SSH connection
