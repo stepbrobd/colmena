@@ -94,7 +94,7 @@ impl RebootOptions {
     }
 }
 
-/// A Nix(OS) host.
+/// A NixOS or nix-darwin host.
 ///
 /// The underlying implementation must be Send and Sync.
 #[async_trait]
@@ -156,7 +156,7 @@ pub trait Host: Send + Sync + std::fmt::Debug {
     /// to `/run/current-system` if it doesn't exist.
     async fn get_main_system_profile(&mut self) -> ColmenaResult<Profile>;
 
-    /// Activates a system profile on the host, if it runs NixOS.
+    /// Activates a system profile on the host.
     ///
     /// The profile must already exist on the host.
     #[allow(unused_variables)]

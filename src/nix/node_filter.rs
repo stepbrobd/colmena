@@ -165,6 +165,8 @@ mod tests {
 
     use std::collections::{HashMap, HashSet};
 
+    use crate::nix::SystemType;
+
     macro_rules! node {
         ($n:expr) => {
             NodeName::new($n.to_string()).unwrap()
@@ -247,6 +249,7 @@ mod tests {
             privilege_escalation_command: vec![],
             extra_ssh_options: vec![],
             keys: HashMap::new(),
+            system_type: SystemType::default(),
         };
 
         let mut nodes = HashMap::new();

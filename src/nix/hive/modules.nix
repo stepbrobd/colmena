@@ -1,4 +1,55 @@
 with builtins;
+let
+  # shell script that chowns the keys uploaded before activation
+  # null when there are none
+  #
+  # We must be careful not to access `text` / `keyCommand` / `keyFile` here
+  chownPreActivationKeys =
+    lib: keys:
+    let
+      preActivationKeys = lib.filterAttrs (name: key: key.uploadAt == "pre-activation") keys;
+
+      commands = lib.mapAttrsToList (
+        name: key:
+        let
+          keyPath = "${key.destDir}/${key.name}";
+        in
+        ''
+          if [ -f "${keyPath}" ]; then
+            if ! chown ${key.user}:${key.group} "${keyPath}"; then
+              # Error should be visible in stderr
+              failed=1
+            fi
+          else
+            >&2 echo "Key ${keyPath} does not exist. Skipping chown."
+          fi
+        ''
+      ) preActivationKeys;
+    in
+    if length commands == 0 then
+      null
+    else
+      ''
+        # This script is injected by Colmena to change the ownerships
+        # of keys (`deployment.keys`) deployed before system activation.
+
+        >&2 echo "setting up key ownerships..."
+
+        # We set the ownership of as many keys as possible before failing
+        failed=
+
+        ${concatStringsSep "\n" commands}
+
+        if [ -n "$failed" ]; then
+          >&2 echo "Failed to set the ownership of some keys."
+
+          # The activation script has a trap to handle failed
+          # commands and print out various debug information.
+          # Let's trigger that instead of `exit 1`.
+          false
+        fi
+      '';
+in
 {
   assertionModule =
     {
@@ -32,55 +83,41 @@ with builtins;
   # Change the ownership of all keys uploaded pre-activation
   #
   # This is built as part of the system profile.
-  # We must be careful not to access `text` / `keyCommand` / `keyFile` here
   keyChownModule =
     { lib, config, ... }:
     let
-      preActivationKeys = lib.filterAttrs (
-        name: key: key.uploadAt == "pre-activation"
-      ) config.deployment.keys;
       scriptDeps = if config.system.activationScripts ? groups then [ "groups" ] else [ "users" ];
-
-      commands = lib.mapAttrsToList (
-        name: key:
-        let
-          keyPath = "${key.destDir}/${key.name}";
-        in
-        ''
-          if [ -f "${keyPath}" ]; then
-            if ! chown ${key.user}:${key.group} "${keyPath}"; then
-              # Error should be visible in stderr
-              failed=1
-            fi
-          else
-            >&2 echo "Key ${keyPath} does not exist. Skipping chown."
-          fi
-        ''
-      ) preActivationKeys;
-
-      script = lib.stringAfter scriptDeps ''
-        # This script is injected by Colmena to change the ownerships
-        # of keys (`deployment.keys`) deployed before system activation.
-
-        >&2 echo "setting up key ownerships..."
-
-        # We set the ownership of as many keys as possible before failing
-        failed=
-
-        ${concatStringsSep "\n" commands}
-
-        if [ -n "$failed" ]; then
-          >&2 echo "Failed to set the ownership of some keys."
-
-          # The activation script has a trap to handle failed
-          # commands and print out various debug information.
-          # Let's trigger that instead of `exit 1`.
-          false
-        fi
-      '';
+      script = chownPreActivationKeys lib config.deployment.keys;
     in
     {
-      system.activationScripts.colmena-chown-keys = lib.mkIf (length commands != 0) script;
+      system.activationScripts.colmena-chown-keys = lib.mkIf (script != null) (
+        lib.stringAfter scriptDeps script
+      );
+    };
+
+  # nix-darwin runs postActivation last
+  # users and groups exist by then
+  # activate has no trap
+  # a failed chown stops it before it links /run/current-system
+  keyChownDarwinModule =
+    { lib, config, ... }:
+    let
+      script = chownPreActivationKeys lib config.deployment.keys;
+    in
+    {
+      # macOS has no root group
+      # gid 0 is wheel
+      options.deployment.keys = lib.mkOption {
+        type = lib.types.attrsOf (
+          lib.types.submodule {
+            group = lib.mkDefault "wheel";
+          }
+        );
+      };
+
+      config.system.activationScripts.postActivation.text = lib.mkIf (script != null) (
+        lib.mkAfter script
+      );
     };
 
   # Create "${name}-key" services for NixOps compatibility

@@ -112,6 +112,17 @@ impl Deployment {
     /// If a ProgressSender is supplied, then this should be run in parallel
     /// with its `run_until_completion()` future.
     pub async fn execute(mut self) -> ColmenaResult<()> {
+        // fail before anything is built or pushed
+        for target in self.targets.values() {
+            let system_type = target.config.system_type();
+            if !system_type.supports(self.goal) {
+                return Err(ColmenaError::UnsupportedGoal {
+                    goal: self.goal,
+                    system_type,
+                });
+            }
+        }
+
         let (mut monitor, meta) = JobMonitor::new(self.progress.clone());
 
         if let Some(width) = self.targets.keys().map(|n| n.len()).max() {
