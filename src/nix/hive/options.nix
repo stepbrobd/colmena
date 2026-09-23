@@ -212,6 +212,19 @@ rec {
             ];
             default = "nixos";
           };
+          detachedActivation = lib.mkOption {
+            description = ''
+              Whether to run the `switch` and `test` activations of a NixOS node
+              in a transient systemd unit, which keeps running when the
+              activation drops the SSH connection.
+
+              Colmena follows the unit over SSH and reconnects when the
+              connection drops. When disabled, the activation runs as a child
+              of the SSH session.
+            '';
+            type = types.bool;
+            default = true;
+          };
           keys = lib.mkOption {
             description = ''
               A set of secrets to be deployed to the node.
