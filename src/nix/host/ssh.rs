@@ -394,7 +394,7 @@ impl Ssh {
         let path = key.path();
         let key_script = key_uploader::generate_script(key, path, require_ownership);
 
-        let command = self.ssh(&["sh", "-c", key_script.as_ref()]);
+        let command = self.ssh_argv(vec!["sh".to_string(), "-c".to_string(), key_script]);
         key_uploader::feed_uploader(command, key, self.job.clone()).await
     }
 

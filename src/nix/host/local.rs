@@ -158,10 +158,7 @@ impl Local {
         }
 
         let path = key.path();
-        let key_script = format!(
-            "'{}'",
-            key_uploader::generate_script(key, path, require_ownership)
-        );
+        let key_script = key_uploader::generate_script(key, path, require_ownership);
 
         let command = self.make_privileged_command(&["sh", "-c", &key_script]);
         key_uploader::feed_uploader(command, key, self.job.clone()).await
