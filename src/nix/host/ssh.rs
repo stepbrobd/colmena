@@ -10,12 +10,10 @@ use shell_escape::unix::escape;
 use tokio::process::Command;
 use tokio::time::sleep;
 
-use super::{CopyDirection, CopyOptions, Host, RebootOptions, key_uploader};
+use super::{CopyDirection, CopyOptions, Host, MAIN_PROFILE_SCRIPT, RebootOptions, key_uploader};
 use crate::error::{ColmenaError, ColmenaResult};
 use crate::job::JobHandle;
-use crate::nix::{
-    CURRENT_PROFILE, Goal, Key, NixCommand, NixFlags, Profile, SYSTEM_PROFILE, StorePath,
-};
+use crate::nix::{CURRENT_PROFILE, Goal, Key, NixCommand, NixFlags, Profile, StorePath};
 use crate::util::{CommandExecution, CommandExt};
 
 /// A remote machine connected over SSH.
@@ -110,7 +108,7 @@ impl Host for Ssh {
 
     async fn get_current_system_profile(&mut self) -> ColmenaResult<Profile> {
         let paths = self
-            .ssh(&["readlink", "-e", CURRENT_PROFILE])
+            .ssh(&["readlink", "-f", CURRENT_PROFILE])
             .capture_output()
             .await?;
 
@@ -125,15 +123,12 @@ impl Host for Ssh {
     }
 
     async fn get_main_system_profile(&mut self) -> ColmenaResult<Profile> {
-        let command = format!(
-            "\"readlink -e {} || readlink -e {}\"",
-            SYSTEM_PROFILE, CURRENT_PROFILE
-        );
-
-        let paths = self
-            .ssh(&["sh", "-c", command.as_str()])
-            .capture_output()
-            .await?;
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            MAIN_PROFILE_SCRIPT.to_string(),
+        ];
+        let paths = self.ssh_argv(argv).capture_output().await?;
 
         let path = paths
             .lines()

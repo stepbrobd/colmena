@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use const_format::formatcp;
 
-use super::{Goal, Key, Profile, StorePath};
+use super::{CURRENT_PROFILE, Goal, Key, Profile, SYSTEM_PROFILE, StorePath};
 use crate::error::{ColmenaError, ColmenaResult};
 use crate::job::JobHandle;
 
@@ -13,6 +14,15 @@ mod local;
 pub use local::Local;
 
 mod key_uploader;
+
+/// Prints the main system profile, falling back to the current one.
+///
+/// `readlink -f` works on GNU and BSD, unlike `-e`, and also prints a
+/// target that does not exist. `[ -e ]` skips a dangling system profile,
+/// and the current profile always resolves on a live node.
+const MAIN_PROFILE_SCRIPT: &str = formatcp!(
+    "if [ -e {SYSTEM_PROFILE} ]; then readlink -f {SYSTEM_PROFILE}; else readlink -f {CURRENT_PROFILE}; fi"
+);
 
 #[derive(Copy, Clone, Debug)]
 pub enum CopyDirection {
@@ -164,5 +174,39 @@ pub trait Host: Send + Sync + std::fmt::Debug {
     #[allow(unused_variables)]
     async fn reboot(&mut self, options: RebootOptions) -> ColmenaResult<()> {
         Err(ColmenaError::Unsupported)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::symlink;
+    use std::process::Command;
+
+    use super::*;
+
+    #[test]
+    fn test_main_profile_script_skips_dangling_system_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let system = dir.path().join("system");
+        let current = dir.path().join("current");
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        symlink(dir.path().join("gone"), &system).unwrap();
+        symlink(&target, &current).unwrap();
+
+        let script = MAIN_PROFILE_SCRIPT
+            .replace(SYSTEM_PROFILE, system.to_str().unwrap())
+            .replace(CURRENT_PROFILE, current.to_str().unwrap());
+        let mut sh = Command::new("sh");
+        // the dev shell puts GNU readlink first
+        #[cfg(target_os = "macos")]
+        sh.env("PATH", "/usr/bin:/bin");
+        let output = sh.args(["-c", &script]).output().unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(
+            target.canonicalize().unwrap().to_str(),
+            String::from_utf8(output.stdout).unwrap().lines().next()
+        );
     }
 }
