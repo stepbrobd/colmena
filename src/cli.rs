@@ -175,7 +175,6 @@ struct HiveOpts {
 enum Command {
     Apply(command::apply::Opts),
 
-    #[cfg(target_os = "linux")]
     ApplyLocal(command::apply_local::Opts),
 
     /// Build configurations but not push to remote machines
@@ -317,7 +316,7 @@ pub async fn run() {
             let hive = load_hive(&opts.hive, flags).await;
             r(command::apply::run(hive, args)).await
         }
-        #[cfg(target_os = "linux")]
+
         Command::ApplyLocal(args) => {
             let hive = load_hive(&opts.hive, flags).await;
             r(command::apply_local::run(hive, args)).await

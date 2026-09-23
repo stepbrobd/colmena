@@ -8,7 +8,7 @@ use tokio::process::Command;
 use super::{CopyDirection, CopyOptions, Host, MAIN_PROFILE_SCRIPT, key_uploader};
 use crate::error::{ColmenaError, ColmenaResult};
 use crate::job::JobHandle;
-use crate::nix::{CURRENT_PROFILE, Goal, Key, NixFlags, Profile, StorePath};
+use crate::nix::{CURRENT_PROFILE, Goal, Key, NixFlags, Profile, StorePath, SystemType};
 use crate::util::{CommandExecution, CommandExt};
 
 /// The local machine running Colmena.
@@ -20,6 +20,7 @@ pub struct Local {
     job: Option<JobHandle>,
     nix_flags: NixFlags,
     privilege_escalation_command: Option<Vec<String>>,
+    system_type: SystemType,
 }
 
 impl Local {
@@ -28,6 +29,7 @@ impl Local {
             job: None,
             nix_flags,
             privilege_escalation_command: None,
+            system_type: SystemType::default(),
         }
     }
 }
@@ -77,15 +79,17 @@ impl Host for Local {
             return Err(ColmenaError::Unsupported);
         }
 
+        let activation_command = profile.activation_command(goal, self.system_type)?;
+
         if goal.should_switch_profile() {
-            let argv = profile.switch_profile_command(&self.nix_flags).into_argv();
+            let argv = profile
+                .switch_profile_command(&self.nix_flags)
+                .bin_dir(self.system_type.nix_bin_dir())
+                .into_argv();
             self.make_privileged_command(&argv).passthrough().await?;
         }
 
-        let command = {
-            let activation_command = profile.activation_command(goal).unwrap();
-            self.make_privileged_command(&activation_command)
-        };
+        let command = self.make_privileged_command(&activation_command);
 
         let mut execution = CommandExecution::new(command);
 
@@ -132,9 +136,12 @@ impl Host for Local {
 }
 
 impl Local {
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn set_privilege_escalation_command(&mut self, command: Option<Vec<String>>) {
         self.privilege_escalation_command = command;
+    }
+
+    pub fn set_system_type(&mut self, system_type: SystemType) {
+        self.system_type = system_type;
     }
 
     pub fn upcast(self) -> Box<dyn Host> {

@@ -4,12 +4,12 @@ use std::process::Stdio;
 
 use super::{
     BuildResult, ColmenaError, ColmenaResult, Goal, NixCommand, NixFlags, SYSTEM_PROFILE,
-    StoreDerivation, StorePath,
+    StoreDerivation, StorePath, SystemType,
 };
 
 pub type ProfileDerivation = StoreDerivation<Profile>;
 
-/// A NixOS system profile.
+/// A NixOS or nix-darwin system profile.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Profile(StorePath);
 
@@ -22,18 +22,35 @@ impl Profile {
     }
 
     /// Returns the command to activate this profile.
-    pub fn activation_command(&self, goal: Goal) -> Option<Vec<String>> {
-        if let Some(goal) = goal.as_str() {
-            let path = self.as_path().join("bin/switch-to-configuration");
-            let switch_to_configuration = path
-                .to_str()
-                .expect("The string should be UTF-8 valid")
-                .to_string();
+    ///
+    /// Fails for a goal that does not activate, and for one the system type
+    /// does not support, see [`SystemType::supports`].
+    pub fn activation_command(
+        &self,
+        goal: Goal,
+        system_type: SystemType,
+    ) -> ColmenaResult<Vec<String>> {
+        let action = goal
+            .as_str()
+            .filter(|_| goal.requires_activation() && system_type.supports(goal))
+            .ok_or(ColmenaError::UnsupportedGoal { goal, system_type })?;
 
-            Some(vec![switch_to_configuration, goal.to_string()])
-        } else {
-            None
-        }
+        Ok(match system_type {
+            SystemType::NixOS => vec![
+                self.entry("bin/switch-to-configuration"),
+                action.to_string(),
+            ],
+            SystemType::Darwin => vec![self.entry("activate")],
+        })
+    }
+
+    /// Returns the path of an entry in the profile.
+    fn entry(&self, name: &str) -> String {
+        self.as_path()
+            .join(name)
+            .to_str()
+            .expect("The store path should be UTF-8 valid")
+            .to_string()
     }
 
     /// Returns the store path.
@@ -90,5 +107,39 @@ impl TryFrom<BuildResult<Profile>> for Profile {
         let path = paths.iter().next().unwrap().to_owned();
 
         Ok(Self::from_store_path_unchecked(path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile() -> Profile {
+        let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x".to_string();
+        Profile::from_store_path_unchecked(path.try_into().unwrap())
+    }
+
+    #[test]
+    fn test_darwin_activates_only_switch() {
+        for goal in [
+            Goal::Build,
+            Goal::Push,
+            Goal::Boot,
+            Goal::Test,
+            Goal::DryActivate,
+            Goal::UploadKeys,
+        ] {
+            assert!(
+                profile()
+                    .activation_command(goal, SystemType::Darwin)
+                    .is_err()
+            );
+        }
+
+        assert!(
+            profile()
+                .activation_command(Goal::Switch, SystemType::Darwin)
+                .is_ok()
+        );
     }
 }

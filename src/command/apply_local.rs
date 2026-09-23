@@ -8,7 +8,7 @@ use crate::error::ColmenaError;
 
 use crate::nix::Hive;
 use crate::nix::deployment::{Deployment, Goal, Options, TargetNode};
-use crate::nix::{NodeName, host::Local as LocalHost};
+use crate::nix::{NodeName, SystemType, host::Local as LocalHost};
 use crate::progress::SimpleProgressOutput;
 
 /// Apply configurations on the local machine
@@ -67,15 +67,18 @@ pub async fn run(
     }
 
     // Sanity check: Are we running NixOS?
-    if let Ok(os_release) = fs::read_to_string("/etc/os-release").await {
-        let re = Regex::new(r#"ID="?nixos"?"#).unwrap();
-        if !re.is_match(&os_release) {
-            tracing::error!("\"apply-local\" only works on NixOS machines.");
+    // macOS has no /etc/os-release
+    if !cfg!(target_os = "macos") {
+        if let Ok(os_release) = fs::read_to_string("/etc/os-release").await {
+            let re = Regex::new(r#"ID="?nixos"?"#).unwrap();
+            if !re.is_match(&os_release) {
+                tracing::error!("\"apply-local\" only works on NixOS or nix-darwin machines.");
+                quit::with_code(5);
+            }
+        } else {
+            tracing::error!("Could not detect the OS version from /etc/os-release.");
             quit::with_code(5);
         }
-    } else {
-        tracing::error!("Could not detect the OS version from /etc/os-release.");
-        quit::with_code(5);
     }
 
     let verbose = verbose || sudo; // cannot use spinners with interactive sudo
@@ -106,7 +109,16 @@ pub async fn run(
                 tracing::error!("Hint: Set deployment.allowLocalDeployment to true.");
                 quit::with_code(2);
             }
+            if (info.system_type() == SystemType::Darwin) != cfg!(target_os = "macos") {
+                tracing::error!(
+                    "Node {} has system type {} and this machine does not.",
+                    hostname.as_str(),
+                    info.system_type()
+                );
+                quit::with_code(5);
+            }
             let mut host = LocalHost::new(nix_flags);
+            host.set_system_type(info.system_type());
             if sudo {
                 let command = info.privilege_escalation_command().to_owned();
                 host.set_privilege_escalation_command(Some(command));

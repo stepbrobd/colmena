@@ -13,7 +13,9 @@ use tokio::time::sleep;
 use super::{CopyDirection, CopyOptions, Host, MAIN_PROFILE_SCRIPT, RebootOptions, key_uploader};
 use crate::error::{ColmenaError, ColmenaResult};
 use crate::job::JobHandle;
-use crate::nix::{CURRENT_PROFILE, Goal, Key, NixCommand, NixFlags, Profile, StorePath};
+use crate::nix::{
+    CURRENT_PROFILE, Goal, Key, NixCommand, NixFlags, Profile, StorePath, SystemType,
+};
 use crate::util::{CommandExecution, CommandExt};
 
 /// A remote machine connected over SSH.
@@ -43,6 +45,9 @@ pub struct Ssh {
     /// Flags to pass to Nix invocations, local and remote.
     nix_flags: NixFlags,
 
+    /// The type of system running on the host.
+    system_type: SystemType,
+
     job: Option<JobHandle>,
 }
 
@@ -63,7 +68,10 @@ impl Host for Ssh {
     }
 
     async fn realize_remote(&mut self, derivation: &StorePath) -> ColmenaResult<Vec<StorePath>> {
-        let argv = derivation.realise_command(&self.nix_flags).into_argv();
+        let argv = derivation
+            .realise_command(&self.nix_flags)
+            .bin_dir(self.system_type.nix_bin_dir())
+            .into_argv();
         let command = self.ssh_argv(argv);
 
         let mut execution = CommandExecution::new(command);
@@ -95,13 +103,17 @@ impl Host for Ssh {
             return Err(ColmenaError::Unsupported);
         }
 
+        let activation_command = profile.activation_command(goal, self.system_type)?;
+
         if goal.should_switch_profile() {
-            let argv = profile.switch_profile_command(&self.nix_flags).into_argv();
+            let argv = profile
+                .switch_profile_command(&self.nix_flags)
+                .bin_dir(self.system_type.nix_bin_dir())
+                .into_argv();
             let set_profile = self.ssh_argv(argv);
             self.run_command(set_profile).await?;
         }
 
-        let activation_command = profile.activation_command(goal).unwrap();
         let command = self.ssh(&activation_command);
         self.run_command(command).await
     }
@@ -161,8 +173,11 @@ impl Host for Ssh {
         // Wait for node to come back up
         loop {
             // Ignore errors while waiting
+            // nix-darwin links /run/current-system from a launchd job that sshd does not wait for
             if let Ok(new_id) = self.get_boot_id().await
                 && new_id != old_id
+                && (self.system_type == SystemType::NixOS
+                    || self.get_current_system_profile().await.is_ok())
             {
                 break;
             }
@@ -194,6 +209,7 @@ impl Ssh {
             extra_ssh_options: Vec::new(),
             use_nix3_copy: false,
             nix_flags,
+            system_type: SystemType::default(),
             job: None,
         }
     }
@@ -216,6 +232,10 @@ impl Ssh {
 
     pub fn set_use_nix3_copy(&mut self, enable: bool) {
         self.use_nix3_copy = enable;
+    }
+
+    pub fn set_system_type(&mut self, system_type: SystemType) {
+        self.system_type = system_type;
     }
 
     pub fn upcast(self) -> Box<dyn Host> {
@@ -281,8 +301,14 @@ impl Ssh {
     ) -> Command {
         let ssh_options = self.ssh_options();
         let ssh_options_str = ssh_options.join(" ");
+        let bin_dir = self.system_type.nix_bin_dir();
 
-        let mut command = if self.use_nix3_copy {
+        // nix-copy-closure finds the remote nix-store through PATH
+        // root's PATH on macOS lacks it
+        // nix copy can name the remote nix-daemon instead
+        let use_nix3_copy = self.use_nix3_copy || bin_dir.is_some();
+
+        let mut command = if use_nix3_copy {
             // experimental `nix copy` command with ssh-ng://
             let mut command =
                 NixCommand::nix(self.nix_flags.clone()).args(["copy", "--no-check-sigs"]);
@@ -304,9 +330,17 @@ impl Ssh {
                 CopyDirection::FromRemote => command.arg("--from"),
             };
 
-            let mut store_uri = format!("ssh-ng://{}", self.ssh_target());
+            let mut params = Vec::new();
+            if let Some(dir) = bin_dir {
+                params.push(format!("remote-program={dir}/nix-daemon"));
+            }
             if options.gzip {
-                store_uri += "?compress=true";
+                params.push("compress=true".to_string());
+            }
+
+            let mut store_uri = format!("ssh-ng://{}", self.ssh_target());
+            if !params.is_empty() {
+                store_uri = format!("{store_uri}?{}", params.join("&"));
             }
 
             command.arg(store_uri).arg(path.as_path()).build()
@@ -402,10 +436,12 @@ impl Ssh {
 
     /// Returns the current Boot ID.
     async fn get_boot_id(&mut self) -> ColmenaResult<BootId> {
-        let boot_id = self
-            .ssh(&["cat", "/proc/sys/kernel/random/boot_id"])
-            .capture_output()
-            .await?;
+        let command: &[&str] = match self.system_type {
+            SystemType::NixOS => &["cat", "/proc/sys/kernel/random/boot_id"],
+            SystemType::Darwin => &["sysctl", "-n", "kern.bootsessionuuid"],
+        };
+
+        let boot_id = self.ssh(command).capture_output().await?;
 
         Ok(BootId(boot_id))
     }
