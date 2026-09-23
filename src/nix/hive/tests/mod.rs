@@ -3,6 +3,7 @@
 use super::*;
 
 use crate::error::ColmenaError;
+use crate::nix::SystemType;
 use crate::nix::deployment::{Deployment, EvaluationNodeLimit, EvaluatorType, Goal, Options};
 use std::collections::HashSet;
 use std::fs;
@@ -827,4 +828,277 @@ fn test_user_builders_override_machines_file() {
             .any(|w| w == ["--option", "builders", "@/custom/machines"])
     );
     assert!(!argv.contains(&"@/etc/nix/machines".to_string()));
+}
+
+/// Builds a hive from `nodes` whose `meta.nix-darwin` stubs `darwinSystem`
+/// with the module system for the `system` colmena passes.
+///
+/// The stub declares the nix-darwin options colmena sets, defaults the
+/// nixpkgs source to its own input like `darwinSystem` does, and tags its
+/// nodes so tests can tell which evaluator ran.
+fn darwin_hive(nodes: &str) -> String {
+    format!(
+        r#"
+      {{
+        meta.nix-darwin.lib.darwinSystem = {{ lib, modules, specialArgs, system }}:
+          lib.evalModules {{
+            modules = modules ++ [
+              ({{ lib, ... }}: {{
+                options = {{
+                  nixpkgs.source = lib.mkOption {{ type = lib.types.unspecified; }};
+                  nixpkgs.flake.source = lib.mkOption {{ type = lib.types.unspecified; }};
+                  nixpkgs.overlays = lib.mkOption {{ type = lib.types.listOf lib.types.unspecified; default = [ ]; }};
+                  nixpkgs.config = lib.mkOption {{ type = lib.types.attrsOf lib.types.unspecified; default = {{ }}; }};
+                  assertions = lib.mkOption {{ type = lib.types.listOf lib.types.unspecified; default = [ ]; }};
+                  system.activationScripts.postActivation.text = lib.mkOption {{ type = lib.types.lines; default = ""; }};
+                }};
+                config = {{
+                  _module.check = false;
+                  _module.args.pkgs.stdenv.hostPlatform = lib.systems.elaborate system;
+                  nixpkgs.source = lib.mkDefault "nix-darwin-input";
+                  nixpkgs.flake.source = lib.mkDefault "nix-darwin-input";
+                  deployment.tags = [ "darwin-stub" ];
+                }};
+              }})
+            ];
+            inherit specialArgs;
+          }};
+        {nodes}
+      }}
+    "#
+    )
+}
+
+fn assert_darwin_evaluated(nodes: &str) {
+    let hive = TempHive::new(&darwin_hive(nodes));
+    let nodes = block_on(hive.deployment_info()).unwrap();
+    let test = &nodes[&node!("test")];
+
+    assert_eq!(SystemType::Darwin, test.system_type());
+    assert_eq!(["darwin-stub".to_string()], test.tags());
+}
+
+#[test]
+fn test_system_type_darwin() {
+    assert_darwin_evaluated(r#"test = { deployment.systemType = "darwin"; };"#);
+}
+
+#[test]
+fn test_system_type_darwin_in_defaults() {
+    assert_darwin_evaluated(r#"defaults.deployment.systemType = "darwin"; test = { };"#);
+}
+
+#[test]
+fn test_system_type_darwin_requires_nix_darwin() {
+    // without meta.nix-darwin the node would evaluate as NixOS
+    // that must fail instead of producing a NixOS profile
+    TempHive::invalid(
+        r#"
+      {
+        test = {
+          deployment.systemType = "darwin";
+        };
+      }
+    "#,
+    );
+}
+
+#[test]
+fn test_system_type_probe_accepts_modules_path() {
+    // generated hardware-configuration.nix files import through modulesPath
+    TempHive::valid(&darwin_hive(
+        r#"test = { modulesPath, ... }: {
+          imports = [ (modulesPath + "/profiles/minimal.nix") ];
+          boot.isContainer = true;
+        };"#,
+    ));
+}
+
+#[test]
+fn test_system_type_probe_passes_pkgs() {
+    // the probe reads every deployment definition of a node
+    TempHive::valid(&darwin_hive(
+        r#"test = { lib, pkgs, ... }: {
+          boot.isContainer = true;
+          deployment = { } // lib.optionalAttrs pkgs.stdenv.isLinux { tags = [ "linux" ]; };
+        };"#,
+    ));
+}
+
+#[test]
+fn test_nixos_hive_skips_system_type_probe() {
+    // the probe declares only the deployment options
+    TempHive::valid(
+        r#"
+      {
+        test = { config, lib, ... }: {
+          boot.isContainer = true;
+          deployment = { } // lib.optionalAttrs config.boot.isContainer { tags = [ "container" ]; };
+        };
+      }
+    "#,
+    );
+}
+
+#[test]
+fn test_nodes_argument_skips_system_type_check() {
+    // deployment reads a node through nodes, which must not force its deployment
+    TempHive::valid(
+        r#"
+      {
+        defaults = { nodes, lib, ... }: {
+          boot.isContainer = true;
+          deployment = lib.optionalAttrs nodes.bastion.config.services.openssh.enable {
+            tags = [ "behind-bastion" ];
+          };
+        };
+        bastion = { services.openssh.enable = true; };
+      }
+    "#,
+    );
+}
+
+#[test]
+fn test_darwin_rejects_boot_before_building() {
+    let TempHive { hive, _temp_file } = TempHive::new(&darwin_hive(
+        r#"test = { deployment.systemType = "darwin"; };"#,
+    ));
+
+    let targets = block_on(hive.select_nodes(None, None, false)).unwrap();
+    let deployment = Deployment::new(hive, targets, Goal::Boot, None);
+
+    assert!(matches!(
+        block_on(deployment.execute()),
+        Err(ColmenaError::UnsupportedGoal { .. })
+    ));
+}
+
+#[test]
+fn test_darwin_nixpkgs_overlays_and_config_from_meta() {
+    let hive = TempHive::new(&darwin_hive(
+        r#"
+        meta.nixpkgs = import <nixpkgs> {
+          overlays = [ (final: prev: { colmenaMarker = 1; }) ];
+          config.allowUnfree = true;
+        };
+        test = { deployment.systemType = "darwin"; };
+        "#,
+    ));
+    let expr = r#"
+      { nodes, lib, ... }:
+        let nixpkgs = nodes.test.config.nixpkgs; in
+        lib.length nixpkgs.overlays == 1 && nixpkgs.config.allowUnfree
+    "#;
+    assert_eq!(
+        "true",
+        block_on(hive.introspect(expr.to_string(), false)).unwrap()
+    );
+}
+
+#[test]
+fn test_darwin_nixpkgs_from_meta() {
+    let hive = TempHive::new(&darwin_hive(
+        r#"test = { deployment.systemType = "darwin"; };"#,
+    ));
+    let expr = r#"
+      { nodes, pkgs, ... }:
+        let config = nodes.test.config; in
+        config.nixpkgs.source == pkgs.path && config.nixpkgs.flake.source == "nix-darwin-input"
+    "#;
+    assert_eq!(
+        "true",
+        block_on(hive.introspect(expr.to_string(), false)).unwrap()
+    );
+
+    // a node's own pin still wins
+    let pinned = TempHive::new(&darwin_hive(
+        r#"test = {
+          deployment.systemType = "darwin";
+          nixpkgs.source = "pinned-by-the-node";
+        };"#,
+    ));
+    let expr = r#"{ nodes, ... }: nodes.test.config.nixpkgs.source"#;
+    assert_eq!(
+        "\"pinned-by-the-node\"",
+        block_on(pinned.introspect(expr.to_string(), false)).unwrap()
+    );
+}
+
+#[test]
+fn test_darwin_node_needs_darwin_nixpkgs() {
+    let failed = r#"
+      { nodes, ... }:
+        map (a: a.message) (builtins.filter (a: !a.assertion) nodes.test.config.assertions)
+    "#;
+    let node = r#"test = { deployment.systemType = "darwin"; };"#;
+
+    let linux = TempHive::new(&darwin_hive(&format!(
+        r#"meta.nixpkgs = import <nixpkgs> {{ system = "x86_64-linux"; }}; {node}"#
+    )));
+    let messages = block_on(linux.introspect(failed.to_string(), false)).unwrap();
+    assert!(messages.contains("test is a darwin node, but its nixpkgs is for x86_64-linux"));
+
+    let darwin = TempHive::new(&darwin_hive(&format!(
+        r#"meta.nixpkgs = import <nixpkgs> {{ system = "x86_64-linux"; }};
+        meta.nodeNixpkgs.test = import <nixpkgs> {{ system = "aarch64-darwin"; }};
+        {node}"#
+    )));
+    assert_eq!(
+        "[]",
+        block_on(darwin.introspect(failed.to_string(), false)).unwrap()
+    );
+}
+
+#[test]
+fn test_darwin_chowns_pre_activation_keys() {
+    // macOS has no root group
+    // the default owner is root:wheel
+    let hive = TempHive::new(&darwin_hive(
+        r#"test = {
+          deployment.systemType = "darwin";
+          deployment.keys.default.keyCommand = [ "true" ];
+          deployment.keys.owned = {
+            keyCommand = [ "true" ];
+            user = "nobody";
+            group = "nogroup";
+          };
+        };"#,
+    ));
+    let expr = r#"
+      { nodes, lib, ... }:
+        let text = nodes.test.config.system.activationScripts.postActivation.text; in
+        lib.hasInfix "chown root:wheel" text && lib.hasInfix "chown nobody:nogroup" text
+    "#;
+    assert_eq!(
+        "true",
+        block_on(hive.introspect(expr.to_string(), false)).unwrap()
+    );
+}
+
+#[test]
+fn test_nixos_defaults_skip_darwin_nodes() {
+    let hive = TempHive::new(&darwin_hive(
+        r#"
+        defaults.deployment.tags = [ "all" ];
+        nixosDefaults.deployment.tags = [ "nixos" ];
+        darwinDefaults.deployment.tags = [ "darwin" ];
+        linux = { boot.isContainer = true; };
+        mac = { deployment.systemType = "darwin"; };
+        "#,
+    ));
+    let nodes = block_on(hive.deployment_info()).unwrap();
+
+    let tags = |name: &str| nodes[&node!(name)].tags().to_vec();
+    assert!(set_eq(
+        &["all".to_string(), "nixos".to_string()],
+        &tags("linux")
+    ));
+    assert!(set_eq(
+        &[
+            "all".to_string(),
+            "darwin".to_string(),
+            "darwin-stub".to_string()
+        ],
+        &tags("mac")
+    ));
 }

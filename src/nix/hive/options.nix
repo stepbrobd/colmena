@@ -73,6 +73,8 @@ rec {
         group = lib.mkOption {
           description = ''
             The group that will own the file.
+
+            On nix-darwin nodes the default is `wheel`, since macOS has no `root` group.
           '';
           default = "root";
           type = types.str;
@@ -147,7 +149,7 @@ rec {
               Colmena.
 
               For local deployment to work, all of the following must be true:
-              - The node must be running NixOS.
+              - The node must be running NixOS or nix-darwin.
               - The node must have deployment.allowLocalDeployment set to true.
               - The node's networking.hostName must match the hostname.
 
@@ -186,6 +188,29 @@ rec {
             '';
             type = types.listOf types.str;
             default = [ ];
+          };
+          systemType = lib.mkOption {
+            description = ''
+              The type of system to deploy.
+
+              - `"nixos"`: NixOS, activated with `switch-to-configuration`
+              - `"darwin"`: macOS with nix-darwin, activated with the `activate` script of its system
+
+              A darwin node also needs `meta.nix-darwin`, and a darwin nixpkgs
+              through `meta.nodeNixpkgs` unless `meta.nixpkgs` is one, or
+              `nixpkgs.hostPlatform` in the node.
+
+              With `meta.nix-darwin` set, Colmena reads this option before it
+              evaluates the node. It must then be a plain value in the node or
+              in `defaults`, and which `deployment` attributes a node defines
+              must not depend on `config` or `nodes`. `lib.mkIf` inside
+              `lib.mkMerge` is fine.
+            '';
+            type = types.enum [
+              "nixos"
+              "darwin"
+            ];
+            default = "nixos";
           };
           keys = lib.mkOption {
             description = ''
@@ -278,6 +303,16 @@ rec {
           '';
           type = types.attrsOf types.unspecified;
           default = { };
+        };
+        nix-darwin = lib.mkOption {
+          description = ''
+            The nix-darwin flake input used to evaluate nix-darwin nodes.
+
+            Required for nodes with `deployment.systemType = "darwin"`.
+          '';
+          type = types.unspecified;
+          default = null;
+          example = lib.literalExpression "inputs.nix-darwin";
         };
         nodeSpecialArgs = lib.mkOption {
           description = ''

@@ -16,6 +16,10 @@ let
     # containing configurations that will be applied to all
     # hosts.
     defaults = { };
+
+    # applied with defaults to the nodes of one system type
+    nixosDefaults = { };
+    darwinDefaults = { };
   };
 
   uncheckedHive =
@@ -147,18 +151,61 @@ let
   lib = nixpkgs.lib;
   reservedNames = [
     "defaults"
+    "nixosDefaults"
+    "darwinDefaults"
     "network"
     "meta"
   ];
 
-  evalNode =
+  mkSpecialArgs =
+    name:
+    {
+      inherit name;
+      nodes = uncheckedNodes;
+    }
+    // hive.meta.specialArgs
+    // (hive.meta.nodeSpecialArgs.${name} or { });
+
+  npkgsFor =
+    name:
+    if hasAttr name hive.meta.nodeNixpkgs then
+      mkNixpkgs "meta.nodeNixpkgs.${name}" hive.meta.nodeNixpkgs.${name}
+    else
+      nixpkgs;
+
+  # the node's own deployment.systemType picks the evaluator
+  # the deployment options are therefore evaluated alone first
+  # modulesPath is the NixOS one
+  # darwin modules rarely import through it
+  probeSystemType =
     name: configs:
     let
-      npkgs =
-        if hasAttr name hive.meta.nodeNixpkgs then
-          mkNixpkgs "meta.nodeNixpkgs.${name}" hive.meta.nodeNixpkgs.${name}
-        else
-          nixpkgs;
+      npkgs = npkgsFor name;
+    in
+    (lib.evalModules {
+      modules = [
+        colmenaOptions.deploymentOptions
+        {
+          _module.check = false;
+          _module.args.pkgs = npkgs;
+        }
+        hive.defaults
+      ]
+      ++ configs;
+      specialArgs = mkSpecialArgs name // {
+        modulesPath = toString (npkgs.path + "/nixos/modules");
+      };
+    }).config.deployment.systemType;
+
+  # hives without meta.nix-darwin never run the probe
+  nodeSystemTypes = lib.genAttrs nodeNames (
+    name: if hive.meta.nix-darwin == null then "nixos" else probeSystemType name (configsFor name)
+  );
+
+  evalNixOSNode =
+    name: configs:
+    let
+      npkgs = npkgsFor name;
       evalConfig = import (npkgs.path + "/nixos/lib/eval-config.nix");
 
       # Here we need to merge the configurations in meta.nixpkgs
@@ -201,15 +248,82 @@ let
         colmenaModules.keyServiceModule
         colmenaOptions.deploymentOptions
         hive.defaults
+        hive.nixosDefaults
       ]
       ++ configs;
-      specialArgs = {
-        inherit name;
-        nodes = uncheckedNodes;
-      }
-      // hive.meta.specialArgs
-      // (hive.meta.nodeSpecialArgs.${name} or { });
+      specialArgs = mkSpecialArgs name;
     };
+
+  evalDarwinNode =
+    name: configs:
+    let
+      npkgs = npkgsFor name;
+
+      darwinSystem =
+        hive.meta.nix-darwin.lib.darwinSystem
+          or (throw "meta.nix-darwin must be the nix-darwin flake input to evaluate ${name}");
+
+      nixpkgsModule =
+        { lib, pkgs, ... }:
+        {
+          # darwinSystem defaults it to the nixpkgs of the nix-darwin input
+          # nixpkgs.flake.source keeps that default
+          # nix.registry would pass a path to builtins.storePath, which pure evaluation forbids
+          nixpkgs.source = lib.mkOverride 900 npkgs.path;
+          nixpkgs.overlays = lib.mkBefore npkgs.overlays;
+          nixpkgs.config = lib.mkBefore npkgs.config;
+
+          # the system comes from meta.nixpkgs unless meta.nodeNixpkgs names the node
+          assertions = [
+            {
+              assertion = pkgs.stdenv.hostPlatform.isDarwin;
+              message = "${name} is a darwin node, but its nixpkgs is for ${pkgs.stdenv.hostPlatform.system}. Set meta.nodeNixpkgs.${name} to a darwin nixpkgs, or nixpkgs.hostPlatform in the node.";
+            }
+          ];
+        };
+    in
+    darwinSystem {
+      # darwinSystem otherwise takes lib and its release check from its own input
+      inherit (npkgs) lib;
+      inherit (npkgs.stdenv.hostPlatform) system;
+
+      modules = [
+        nixpkgsModule
+        colmenaModules.assertionModule
+        colmenaModules.keyChownDarwinModule
+        colmenaOptions.deploymentOptions
+        hive.defaults
+        hive.darwinDefaults
+      ]
+      ++ configs;
+      specialArgs = mkSpecialArgs name;
+    };
+
+  evalNode =
+    name: configs:
+    if nodeSystemTypes.${name} == "darwin" then
+      evalDarwinNode name configs
+    else
+      evalNixOSNode name configs;
+
+  # only the exported nodes are checked
+  # a check in the nodes module argument recurses when deployment reads nodes
+  checkedNode =
+    name:
+    let
+      type = nodeSystemTypes.${name};
+      node = evalNode name (configsFor name);
+      declared = node.config.deployment.systemType;
+      hint =
+        if hive.meta.nix-darwin == null then
+          "Set meta.nix-darwin so the option is read before evaluation."
+        else
+          "Set it to a plain value in the node or in defaults, the only places read before evaluation.";
+    in
+    if declared != type then
+      throw "Node ${name} declares deployment.systemType = \"${declared}\" and was evaluated as ${type}. ${hint}"
+    else
+      node;
 
   nodeNames = filter (name: !elem name reservedNames) (attrNames hive);
 
@@ -249,7 +363,7 @@ rec {
   nodes = listToAttrs (
     map (name: {
       inherit name;
-      value = evalNode name (configsFor name);
+      value = checkedNode name;
     }) nodeNames
   );
   toplevel = lib.mapAttrs (_: v: v.config.system.build.toplevel) nodes;
