@@ -5,7 +5,7 @@ That said, there are a few things to look out for:
 
 ## Colmena deploys to *existing* NixOS hosts
 
-Unlike NixOps which can be configured to manage the entire lifecycles of NixOS machines (e.g., spinning up AWS EC2 instances), Colmena can only deploy to hosts already running NixOS.
+Unlike NixOps which can be configured to manage the entire lifecycles of NixOS machines (e.g., spinning up AWS EC2 instances), Colmena can only deploy to hosts already running NixOS or nix-darwin.
 
 ## `network` vs `meta`
 
