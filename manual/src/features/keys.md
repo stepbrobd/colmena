@@ -27,6 +27,7 @@ For example, to deploy DNS-01 credentials for use with `security.acme`:
 ```
 
 Take note that if you use the default path (`/run/keys`), the secret files are only stored in-memory and will not survive reboots.
+On nix-darwin nodes they are stored on disk, see [macOS with nix-darwin](./nix-darwin.md#secrets).
 To upload your secrets without performing a full deployment, use `colmena upload-keys`.
 
 ## Key Services
