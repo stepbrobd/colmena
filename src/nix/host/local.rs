@@ -5,10 +5,10 @@ use std::process::Stdio;
 use async_trait::async_trait;
 use tokio::process::Command;
 
-use super::{CopyDirection, CopyOptions, Host, key_uploader};
+use super::{CopyDirection, CopyOptions, Host, MAIN_PROFILE_SCRIPT, key_uploader};
 use crate::error::{ColmenaError, ColmenaResult};
 use crate::job::JobHandle;
-use crate::nix::{CURRENT_PROFILE, Goal, Key, NixFlags, Profile, SYSTEM_PROFILE, StorePath};
+use crate::nix::{CURRENT_PROFILE, Goal, Key, NixFlags, Profile, StorePath};
 use crate::util::{CommandExecution, CommandExt};
 
 /// The local machine running Colmena.
@@ -96,7 +96,7 @@ impl Host for Local {
 
     async fn get_current_system_profile(&mut self) -> ColmenaResult<Profile> {
         let paths = Command::new("readlink")
-            .args(["-e", CURRENT_PROFILE])
+            .args(["-f", CURRENT_PROFILE])
             .capture_output()
             .await?;
 
@@ -112,13 +112,7 @@ impl Host for Local {
 
     async fn get_main_system_profile(&mut self) -> ColmenaResult<Profile> {
         let paths = Command::new("sh")
-            .args([
-                "-c",
-                &format!(
-                    "readlink -e {} || readlink -e {}",
-                    SYSTEM_PROFILE, CURRENT_PROFILE
-                ),
-            ])
+            .args(["-c", MAIN_PROFILE_SCRIPT])
             .capture_output()
             .await?;
 
