@@ -1,7 +1,9 @@
 //! Custom error types.
 
+use std::fmt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
+use std::time::Duration;
 
 use snafu::{Backtrace, Snafu};
 use validator::ValidationErrors;
@@ -58,6 +60,69 @@ pub enum ColmenaError {
     #[snafu(display("Could not determine current profile"))]
     FailedToGetCurrentProfile,
 
+    #[snafu(display(
+        "Lost contact with host {} for {} seconds, activation unit {} is in an unknown state: {}",
+        hostname,
+        timeout.as_secs(),
+        unit,
+        reason
+    ))]
+    ActivationUnreachable {
+        hostname: String,
+        unit: String,
+        timeout: Duration,
+        reason: String,
+    },
+
+    #[snafu(display(
+        "Could not start activation unit {} on host {} ({}), set deployment.detachedActivation = false to activate in the SSH session",
+        unit,
+        hostname,
+        source
+    ))]
+    ActivationStartFailed {
+        hostname: String,
+        unit: String,
+        source: Box<ColmenaError>,
+    },
+
+    #[snafu(display(
+        "Activation unit {} on host {} does not exist, the SSH session may have dropped before systemd-run ran",
+        unit,
+        hostname
+    ))]
+    ActivationUnitNotFound { hostname: String, unit: String },
+
+    #[snafu(display(
+        "Activation unit {} on host {} disappeared before it finished, it was stopped or the host rebooted",
+        unit,
+        hostname
+    ))]
+    ActivationUnitVanished { hostname: String, unit: String },
+
+    #[snafu(display(
+        "Activation unit {} on host {} failed with result {}{}",
+        unit,
+        hostname,
+        result,
+        exit.map(|exit| format!(", {exit}")).unwrap_or_default()
+    ))]
+    ActivationFailed {
+        hostname: String,
+        unit: String,
+        result: String,
+        exit: Option<UnitExit>,
+    },
+
+    #[snafu(display("No answer from the activation watch"))]
+    ActivationStepTimeout,
+
+    #[snafu(display("The activation watch ended before the unit finished"))]
+    ActivationWatchEnded,
+
+    #[snafu(display("Unexpected line from the activation watch: {}", line))]
+    ActivationBadOutput { line: String },
+
     #[snafu(display("Don't know how to connect to the node"))]
     NoTargetHost,
 
@@ -72,6 +137,22 @@ pub enum ColmenaError {
 
     #[snafu(display("Exec failed on {} hosts", n_hosts))]
     ExecError { n_hosts: usize },
+}
+
+/// How the main process of a finished systemd unit ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnitExit {
+    Status(i32),
+    Signal(i32),
+}
+
+impl fmt::Display for UnitExit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Status(status) => write!(f, "exit status {status}"),
+            Self::Signal(signal) => write!(f, "killed by signal {signal}"),
+        }
+    }
 }
 
 impl From<std::io::Error> for ColmenaError {

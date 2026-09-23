@@ -2,21 +2,44 @@ use std::collections::HashMap;
 use std::convert::TryInto;
 use std::ffi::OsStr;
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use shell_escape::unix::escape;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep, timeout};
+use uuid::Uuid;
 
 use super::{CopyDirection, CopyOptions, Host, MAIN_PROFILE_SCRIPT, RebootOptions, key_uploader};
-use crate::error::{ColmenaError, ColmenaResult};
+use crate::error::{ColmenaError, ColmenaResult, UnitExit};
 use crate::job::JobHandle;
 use crate::nix::{
     CURRENT_PROFILE, Goal, Key, NixCommand, NixFlags, Profile, StorePath, SystemType,
 };
-use crate::util::{CommandExecution, CommandExt};
+use crate::util::{CommandExecution, CommandExt, capture_stream};
+
+/// Starts and follows a transient activation unit, see its header for the
+/// records it prints.
+const ACTIVATION_WATCH_SCRIPT: &str = include_str!("./activation_watch.sh");
+
+/// How long the host may stay unreachable while an activation unit runs.
+///
+/// A network restart during activation drops the connection for a few
+/// seconds. The window starts at the last state the watch reported, and a
+/// host that stays down fails the deployment when it closes.
+const ACTIVATION_RECONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long the watch may stay silent before its connection counts as lost.
+///
+/// The watch reports every 2 seconds. A network restart can drop an
+/// established connection without a reset, and ssh would then wait forever
+/// for the next line.
+const ACTIVATION_STEP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long to wait before reconnecting to the watch.
+const ACTIVATION_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 /// A remote machine connected over SSH.
 #[derive(Debug)]
@@ -48,12 +71,200 @@ pub struct Ssh {
     /// The type of system running on the host.
     system_type: SystemType,
 
+    /// Whether NixOS switch and test activations run in a transient unit.
+    detached_activation: bool,
+
     job: Option<JobHandle>,
 }
 
 /// An opaque boot ID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BootId(String);
+
+/// The state of a transient activation unit.
+#[derive(Debug, PartialEq, Eq)]
+enum ActivationState {
+    Running,
+    Succeeded,
+    NotFound,
+    Failed {
+        result: String,
+        exit: Option<UnitExit>,
+    },
+}
+
+impl ActivationState {
+    /// Parses the `Key=Value` properties of a status record.
+    ///
+    /// Only an exit with status 0 counts as a success. systemd also reports
+    /// `Result=success` for a process killed by SIGTERM, SIGHUP, SIGINT or
+    /// SIGPIPE.
+    fn parse(properties: &str) -> Option<Self> {
+        let properties: HashMap<&str, &str> = properties
+            .split_whitespace()
+            .filter_map(|property| property.split_once('='))
+            .collect();
+        let get = |key| properties.get(key).copied();
+
+        let (load, active, result) = (get("LoadState")?, get("ActiveState")?, get("Result")?);
+        let status = get("ExecMainStatus")?.parse().ok()?;
+
+        // ExecMainCode is CLD_EXITED (1), CLD_KILLED (2) or CLD_DUMPED (3) once the process ended
+        let exit = match get("ExecMainCode")?.parse().ok()? {
+            0 => None,
+            1 => Some(UnitExit::Status(status)),
+            _ => Some(UnitExit::Signal(status)),
+        };
+
+        Some(match exit {
+            _ if load == "not-found" => Self::NotFound,
+            Some(UnitExit::Status(0)) if result == "success" => Self::Succeeded,
+            None if active != "failed" => Self::Running,
+            exit => Self::Failed {
+                result: result.to_string(),
+                exit,
+            },
+        })
+    }
+}
+
+/// A line printed by the activation watch.
+#[derive(Debug, PartialEq, Eq)]
+enum Record {
+    Log(String),
+    Cursor(String),
+    JournalFailed(String),
+    Unreadable(String),
+    Status(ActivationState),
+}
+
+impl Record {
+    fn parse(line: &str) -> ColmenaResult<Self> {
+        let bad_output = || ColmenaError::ActivationBadOutput {
+            line: line.to_string(),
+        };
+        let (tag, rest) = line.split_once(' ').unwrap_or((line, ""));
+
+        Ok(match tag {
+            "L" => Self::Log(rest.to_string()),
+            "C" => Self::Cursor(rest.to_string()),
+            "J" => Self::JournalFailed(rest.to_string()),
+            "W" => Self::Unreadable(rest.to_string()),
+            "S" => Self::Status(ActivationState::parse(rest).ok_or_else(bad_output)?),
+            _ => return Err(bad_output()),
+        })
+    }
+}
+
+/// What the deployer knows about a detached activation across watch sessions.
+#[derive(Debug)]
+struct Watch {
+    unit: String,
+
+    /// The journal position to resume streaming after.
+    cursor: Option<String>,
+
+    /// Journal lines of this session that wait for the cursor after them.
+    pending: Vec<String>,
+
+    /// Whether a record arrived in this session.
+    answered: bool,
+
+    /// Whether a status record ever showed the unit.
+    seen: bool,
+
+    /// When the last status record arrived.
+    contact: Instant,
+
+    /// Whether a session was lost since the last one that answered.
+    lost: bool,
+
+    /// Why systemctl last failed to read the unit in this session.
+    unreadable: Option<String>,
+
+    /// Whether a journal failure was reported.
+    journal_failed: bool,
+}
+
+impl Watch {
+    fn new(unit: String) -> Self {
+        Self {
+            unit,
+            cursor: None,
+            pending: Vec::new(),
+            answered: false,
+            seen: false,
+            contact: Instant::now(),
+            lost: false,
+            unreadable: None,
+            journal_failed: false,
+        }
+    }
+
+    /// Returns the remote command of a session.
+    ///
+    /// sh reads the script from stdin, so the login shell never parses it.
+    fn argv(&self, start: Option<&[String]>) -> Vec<String> {
+        let mut argv = vec![
+            "sh".to_string(),
+            "-s".to_string(),
+            self.unit.clone(),
+            if start.is_some() { "1" } else { "0" }.to_string(),
+            self.cursor.clone().unwrap_or_default(),
+        ];
+        argv.extend(start.unwrap_or_default().iter().cloned());
+        argv
+    }
+
+    /// Returns the error of a session that exited before the unit finished,
+    /// given whether the session started the unit.
+    fn ended(&self, exit: ExitStatus, start: bool, hostname: &str) -> ColmenaError {
+        if exit.success() {
+            return ColmenaError::ActivationWatchEnded;
+        }
+
+        let error = ColmenaError::from(exit);
+
+        // before the first record, only a lost connection can have started the unit
+        let lost = matches!(error, ColmenaError::ChildFailure { exit_code: 255, .. });
+        if start && !self.answered && !lost {
+            return ColmenaError::ActivationStartFailed {
+                hostname: hostname.to_string(),
+                unit: self.unit.clone(),
+                source: Box::new(error),
+            };
+        }
+
+        error
+    }
+
+    /// Takes in a status record and returns the outcome of the activation,
+    /// or `None` while it runs.
+    fn observe(&mut self, state: ActivationState, hostname: &str) -> Option<ColmenaResult<()>> {
+        self.seen |= state != ActivationState::NotFound;
+        self.contact = Instant::now();
+
+        let hostname = hostname.to_string();
+        let unit = self.unit.clone();
+
+        Some(match state {
+            ActivationState::Running => return None,
+            ActivationState::Succeeded => Ok(()),
+            ActivationState::NotFound if self.seen => {
+                Err(ColmenaError::ActivationUnitVanished { hostname, unit })
+            }
+            ActivationState::NotFound => {
+                Err(ColmenaError::ActivationUnitNotFound { hostname, unit })
+            }
+            ActivationState::Failed { result, exit } => Err(ColmenaError::ActivationFailed {
+                hostname,
+                unit,
+                result,
+                exit,
+            }),
+        })
+    }
+}
 
 #[async_trait]
 impl Host for Ssh {
@@ -112,6 +323,15 @@ impl Host for Ssh {
                 .into_argv();
             let set_profile = self.ssh_argv(argv);
             self.run_command(set_profile).await?;
+        }
+
+        // switch and test may restart the network and drop the session
+        // nix-darwin has no systemd to detach into
+        if self.detached_activation
+            && self.system_type == SystemType::NixOS
+            && matches!(goal, Goal::Switch | Goal::Test)
+        {
+            return self.activate_detached(&activation_command).await;
         }
 
         let command = self.ssh(&activation_command);
@@ -210,6 +430,7 @@ impl Ssh {
             use_nix3_copy: false,
             nix_flags,
             system_type: SystemType::default(),
+            detached_activation: true,
             job: None,
         }
     }
@@ -236,6 +457,10 @@ impl Ssh {
 
     pub fn set_system_type(&mut self, system_type: SystemType) {
         self.system_type = system_type;
+    }
+
+    pub fn set_detached_activation(&mut self, enable: bool) {
+        self.detached_activation = enable;
     }
 
     pub fn upcast(self) -> Box<dyn Host> {
@@ -460,10 +685,194 @@ impl Ssh {
             }
         }
     }
+
+    fn message(&self, message: String) -> ColmenaResult<()> {
+        match &self.job {
+            Some(job) => job.message(message),
+            None => Ok(()),
+        }
+    }
+
+    /// Runs the activation in a transient systemd unit and follows it, so
+    /// that the activation completes even when it drops the SSH session.
+    ///
+    /// A failed unit stays on the host for `systemctl status` and
+    /// `journalctl -u`.
+    async fn activate_detached(&mut self, activation_command: &[String]) -> ColmenaResult<()> {
+        let unit = format!("colmena-activate-{}", Uuid::new_v4().simple());
+        self.message(format!("Starting activation in unit {unit}"))?;
+
+        let mut watch = Watch::new(unit);
+        let mut start = Some(activation_command);
+
+        let outcome = loop {
+            match self.watch_session(&mut watch, start.take()).await {
+                Err(error) if Self::is_retryable(&error) => {
+                    let left = ACTIVATION_RECONNECT_TIMEOUT.saturating_sub(watch.contact.elapsed());
+                    if !watch.lost && !left.is_zero() {
+                        watch.lost = true;
+                        self.message(format!(
+                            "Lost contact with the host ({error}), reconnecting for up to {} seconds",
+                            left.as_secs()
+                        ))?;
+                    }
+
+                    // a session started with no time left would only report its own timeout
+                    sleep(ACTIVATION_RETRY_INTERVAL).await;
+
+                    if watch.contact.elapsed() >= ACTIVATION_RECONNECT_TIMEOUT {
+                        return Err(ColmenaError::ActivationUnreachable {
+                            hostname: self.host.clone(),
+                            unit: watch.unit,
+                            timeout: ACTIVATION_RECONNECT_TIMEOUT,
+                            reason: watch.unreadable.unwrap_or_else(|| error.to_string()),
+                        });
+                    }
+                }
+                outcome => break outcome,
+            }
+        };
+
+        if outcome.is_ok() {
+            self.stop_unit(&watch.unit).await?;
+        }
+
+        outcome
+    }
+
+    /// Runs the watch script once and passes its records to `watch`.
+    ///
+    /// With `start`, the script first starts the unit with that command.
+    /// Returns the outcome of the activation once the unit finishes, or the
+    /// error that ended the session earlier.
+    async fn watch_session(
+        &mut self,
+        watch: &mut Watch,
+        start: Option<&[String]>,
+    ) -> ColmenaResult<()> {
+        let mut command = self.ssh_argv(watch.argv(start));
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = command.spawn()?;
+
+        // a session that ends before it reads the script reports that with its exit
+        let mut stdin = child.stdin.take().unwrap();
+        let _ = stdin.write_all(ACTIVATION_WATCH_SCRIPT.as_bytes()).await;
+        drop(stdin);
+        let stderr = BufReader::new(child.stderr.take().unwrap());
+        tokio::spawn(capture_stream(stderr, self.job.clone(), true));
+
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        if let Some(outcome) = self.follow(watch, &mut stdout).await? {
+            return outcome;
+        }
+
+        let exit = child.wait().await?;
+        Err(watch.ended(exit, start.is_some(), &self.host))
+    }
+
+    /// Passes the records of one session to `watch`, and prints the journal
+    /// lines once the cursor after them arrives.
+    ///
+    /// Returns the outcome of the activation once the unit finishes, or
+    /// `None` when the session ends first.
+    async fn follow(
+        &self,
+        watch: &mut Watch,
+        stdout: &mut (impl AsyncBufRead + Unpin),
+    ) -> ColmenaResult<Option<ColmenaResult<()>>> {
+        watch.unreadable = None;
+        watch.pending.clear();
+        watch.answered = false;
+
+        loop {
+            let limit = ACTIVATION_STEP_TIMEOUT
+                .min(ACTIVATION_RECONNECT_TIMEOUT.saturating_sub(watch.contact.elapsed()));
+
+            let mut line = Vec::new();
+            let read = timeout(limit, stdout.read_until(b'\n', &mut line))
+                .await
+                .map_err(|_| ColmenaError::ActivationStepTimeout)??;
+            // a cut last line means the connection dropped mid record
+            if read == 0 || !line.ends_with(b"\n") {
+                return Ok(None);
+            }
+            // the first record of a session ends an outage
+            if !std::mem::replace(&mut watch.answered, true) && std::mem::take(&mut watch.lost) {
+                self.message("Reconnected to the host".to_string())?;
+            }
+
+            // journal lines are bytes
+            let line = String::from_utf8_lossy(&line);
+            match Record::parse(line.trim_end_matches('\n'))? {
+                // a drop before the cursor makes the next session send the lines again
+                Record::Log(line) => watch.pending.push(line),
+                Record::Cursor(cursor) => {
+                    watch.cursor = Some(cursor);
+                    for line in watch.pending.drain(..) {
+                        if let Some(job) = &self.job {
+                            job.stderr(line)?;
+                        }
+                    }
+                }
+                Record::JournalFailed(status) => {
+                    if !std::mem::replace(&mut watch.journal_failed, true) {
+                        self.message(format!(
+                            "Could not read the journal of unit {}, journalctl exited with {status}",
+                            watch.unit
+                        ))?;
+                    }
+                }
+                Record::Unreadable(reason) => watch.unreadable = Some(reason),
+                // the final status follows every line and cursor of the unit
+                Record::Status(state) => {
+                    if let Some(outcome) = watch.observe(state, &self.host) {
+                        return Ok(Some(outcome));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stops a finished unit, which releases the RemainAfterExit hold and
+    /// lets systemd remove it.
+    async fn stop_unit(&mut self, unit: &str) -> ColmenaResult<()> {
+        let mut command = self.ssh(&["systemctl", "stop", unit]);
+        command.kill_on_drop(true);
+
+        let stopped = timeout(ACTIVATION_STEP_TIMEOUT, self.run_command(command)).await;
+        if !matches!(stopped, Ok(Ok(()))) {
+            self.message(format!(
+                "Could not stop the finished unit {unit}, it stays until `systemctl stop {unit}`"
+            ))?;
+        }
+
+        Ok(())
+    }
+
+    /// Whether a watch session may have failed for a lost connection or for
+    /// access that recovers, rather than for the activation.
+    fn is_retryable(error: &ColmenaError) -> bool {
+        matches!(
+            error,
+            ColmenaError::ChildFailure { .. }
+                | ColmenaError::ChildKilled { .. }
+                | ColmenaError::ActivationStepTimeout
+                | ColmenaError::ActivationWatchEnded
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::process::ExitStatusExt;
+
+    use tokio_test::block_on;
+
     use super::*;
 
     #[test]
@@ -523,6 +932,184 @@ mod tests {
                 use_nix3_copy,
                 args
             );
+        }
+    }
+
+    fn state(properties: &str) -> ActivationState {
+        ActivationState::parse(properties).unwrap()
+    }
+
+    #[test]
+    fn test_activation_state() {
+        use ActivationState::*;
+
+        let failed = |result: &str, exit| Failed {
+            result: result.to_string(),
+            exit,
+        };
+        let cases = [
+            (
+                "active Result=success ExecMainCode=1 ExecMainStatus=0",
+                Succeeded,
+            ),
+            (
+                "failed Result=exit-code ExecMainCode=1 ExecMainStatus=4",
+                failed("exit-code", Some(UnitExit::Status(4))),
+            ),
+            // a process left in the unit was killed after the main process exited
+            (
+                "failed Result=oom-kill ExecMainCode=1 ExecMainStatus=0",
+                failed("oom-kill", Some(UnitExit::Status(0))),
+            ),
+            // systemd counts SIGTERM as a clean exit for Type=exec
+            (
+                "active Result=success ExecMainCode=2 ExecMainStatus=15",
+                failed("success", Some(UnitExit::Signal(15))),
+            ),
+            // failed before the process started
+            (
+                "failed Result=resources ExecMainCode=0 ExecMainStatus=0",
+                failed("resources", None),
+            ),
+            (
+                "active Result=success ExecMainCode=0 ExecMainStatus=0",
+                Running,
+            ),
+            // the start job still waits
+            (
+                "inactive Result=success ExecMainCode=0 ExecMainStatus=0",
+                Running,
+            ),
+        ];
+
+        for (properties, expected) in cases {
+            let properties = format!("LoadState=loaded ActiveState={properties}");
+            assert_eq!(expected, state(&properties), "{properties}");
+        }
+
+        let gone = "LoadState=not-found ActiveState=inactive Result=success ExecMainCode=0 ExecMainStatus=0";
+        assert_eq!(NotFound, state(gone));
+    }
+
+    #[test]
+    fn test_record_parse() {
+        assert_eq!(
+            Record::Log("two  words ".to_string()),
+            Record::parse("L two  words ").unwrap()
+        );
+        assert_eq!(Record::Log(String::new()), Record::parse("L ").unwrap());
+        assert_eq!(
+            Record::Cursor("s=1;i=2".to_string()),
+            Record::parse("C s=1;i=2").unwrap()
+        );
+        assert!(Record::parse("S LoadState=loaded").is_err());
+        assert!(Record::parse("-- cursor: s=1").is_err());
+    }
+
+    #[test]
+    fn test_watch_tells_a_vanished_unit_from_a_missing_one() {
+        let running =
+            "LoadState=loaded ActiveState=active Result=success ExecMainCode=0 ExecMainStatus=0";
+        let gone = "LoadState=not-found ActiveState=inactive Result=success ExecMainCode=0 ExecMainStatus=0";
+
+        let mut missing = Watch::new("unit".to_string());
+        assert!(matches!(
+            missing.observe(state(gone), "host"),
+            Some(Err(ColmenaError::ActivationUnitNotFound { .. }))
+        ));
+
+        let mut vanished = Watch::new("unit".to_string());
+        vanished.contact -= ACTIVATION_RECONNECT_TIMEOUT;
+        assert!(vanished.observe(state(running), "host").is_none());
+        assert!(vanished.contact.elapsed() < ACTIVATION_RECONNECT_TIMEOUT);
+        assert!(matches!(
+            vanished.observe(state(gone), "host"),
+            Some(Err(ColmenaError::ActivationUnitVanished { .. }))
+        ));
+    }
+
+    #[test]
+    fn test_watch_argv_needs_no_escapes() {
+        // sshd hands the command to the login shell, and nushell misreads the escapes of ' and !
+        let mut watch = Watch::new("unit".to_string());
+        watch.cursor = Some("s=1;i=2".to_string());
+        let start = [
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x/bin/switch-to-configuration".to_string(),
+            "switch".to_string(),
+        ];
+
+        let argv = watch.argv(Some(&start));
+        assert!(
+            argv.iter().all(|arg| !arg.contains(['\'', '!'])),
+            "{argv:?}"
+        );
+    }
+
+    fn follow(watch: &mut Watch, records: &[u8]) -> Option<ColmenaResult<()>> {
+        let ssh = Ssh::new(None, "host".to_string(), NixFlags::default());
+        block_on(ssh.follow(watch, &mut BufReader::new(records))).unwrap()
+    }
+
+    #[test]
+    fn test_follow_holds_lines_until_their_cursor() {
+        let mut watch = Watch::new("unit".to_string());
+
+        assert!(follow(&mut watch, b"L one\nC s=1\nL two\n").is_none());
+        assert_eq!(Some("s=1"), watch.cursor.as_deref());
+        assert_eq!(["two"], watch.pending.as_slice());
+    }
+
+    #[test]
+    fn test_follow_starts_each_session_afresh() {
+        let mut watch = Watch::new("unit".to_string());
+        watch.lost = true;
+        watch.unreadable = Some("bus".to_string());
+
+        // the first record of a session ends an outage
+        assert!(follow(&mut watch, b"L one\n").is_none());
+        assert!(!watch.lost);
+        assert_eq!(None, watch.unreadable);
+
+        // a session that dropped before the cursor sends its lines again
+        watch.lost = true;
+        assert!(follow(&mut watch, b"L one\n").is_none());
+        assert!(!watch.lost);
+        assert_eq!(["one"], watch.pending.as_slice());
+    }
+
+    #[test]
+    fn test_follow_ends_at_a_cut_record() {
+        // the connection dropped in the middle of the record
+        let mut watch = Watch::new("unit".to_string());
+
+        assert!(follow(&mut watch, b"S LoadState=loaded ActiveSt").is_none());
+        assert!(!watch.answered);
+    }
+
+    #[test]
+    fn test_first_session_that_fails_before_a_record() {
+        let watch = Watch::new("unit".to_string());
+        let ended = |code| watch.ended(ExitStatus::from_raw(code << 8), true, "host");
+
+        // ssh exits 255 when the connection drops, possibly after systemd-run
+        assert!(matches!(
+            ended(255),
+            ColmenaError::ChildFailure { exit_code: 255, .. }
+        ));
+        assert!(matches!(
+            ended(1),
+            ColmenaError::ActivationStartFailed { .. }
+        ));
+        assert!(matches!(ended(0), ColmenaError::ActivationWatchEnded));
+
+        // a later session, or one that answered, did not start the unit
+        let mut answered = Watch::new("unit".to_string());
+        answered.answered = true;
+        for (watch, start) in [(&watch, false), (&answered, true)] {
+            assert!(matches!(
+                watch.ended(ExitStatus::from_raw(1 << 8), start, "host"),
+                ColmenaError::ChildFailure { exit_code: 1, .. }
+            ));
         }
     }
 }

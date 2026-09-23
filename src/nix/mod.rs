@@ -105,6 +105,14 @@ pub struct NodeConfig {
     // absent from colmenaHive outputs evaluated before darwin support
     #[serde(rename = "systemType", default)]
     system_type: SystemType,
+
+    // absent from colmenaHive outputs evaluated before detached activation
+    #[serde(rename = "detachedActivation", default = "enabled")]
+    detached_activation: bool,
+}
+
+fn enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Validate, Deserialize)]
@@ -240,6 +248,7 @@ impl NodeConfig {
             host.set_privilege_escalation_command(self.privilege_escalation_command.clone());
             host.set_extra_ssh_options(self.extra_ssh_options.clone());
             host.set_system_type(self.system_type);
+            host.set_detached_activation(self.detached_activation);
 
             if let Some(target_port) = self.target_port {
                 host.set_port(target_port);

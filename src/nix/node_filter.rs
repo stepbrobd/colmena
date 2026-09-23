@@ -250,6 +250,7 @@ mod tests {
             extra_ssh_options: vec![],
             keys: HashMap::new(),
             system_type: SystemType::default(),
+            detached_activation: true,
         };
 
         let mut nodes = HashMap::new();
