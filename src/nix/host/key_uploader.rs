@@ -4,7 +4,6 @@
 //! of the secret file from stdin into a temporary file then atomically
 //! replaces the destination file with the temporary file.
 
-use std::borrow::Cow;
 use std::path::Path;
 
 use futures::future::join3;
@@ -19,12 +18,9 @@ use crate::util::capture_stream;
 
 const SCRIPT_TEMPLATE: &str = include_str!("./key_uploader.template.sh");
 
-pub fn generate_script<'a>(
-    key: &'a Key,
-    destination: &'a Path,
-    require_ownership: bool,
-) -> Cow<'a, str> {
-    let key_script = SCRIPT_TEMPLATE
+/// Returns the uploader script, to be run with `sh -c`.
+pub fn generate_script(key: &Key, destination: &Path, require_ownership: bool) -> String {
+    SCRIPT_TEMPLATE
         .to_string()
         .replace("%DESTINATION%", destination.to_str().unwrap())
         .replace("%USER%", &escape(key.user().into()))
@@ -35,9 +31,7 @@ pub fn generate_script<'a>(
             if require_ownership { "1" } else { "" },
         )
         .trim_end_matches('\n')
-        .to_string();
-
-    escape(key_script.into())
+        .to_string()
 }
 
 pub async fn feed_uploader(
@@ -73,5 +67,51 @@ pub async fn feed_uploader(
         Ok(())
     } else {
         Err(exit.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    use tokio_test::block_on;
+
+    use super::super::{Host, Local};
+    use crate::error::ColmenaResult;
+    use crate::nix::{Key, NixFlags};
+
+    fn key(dir: &Path, user: &str, group: &str) -> Key {
+        serde_json::from_value(serde_json::json!({
+            "name": "secret",
+            "path": dir.join("secret"),
+            "text": "hunter2",
+            "destDir": dir,
+            "user": user,
+            "group": group,
+            "permissions": "0600",
+            "uploadAt": "pre-activation",
+        }))
+        .unwrap()
+    }
+
+    fn upload(key: Key, require_ownership: bool) -> ColmenaResult<()> {
+        let keys = HashMap::from([("secret".to_string(), key)]);
+        block_on(Local::new(NixFlags::default()).upload_keys(&keys, require_ownership))
+    }
+
+    #[test]
+    fn test_local_upload_keeps_bang_in_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("a!b");
+        // chown to another user needs root
+        // the uploader skips chown for an unknown owner
+        let unknown = "colmena-no-such-user";
+
+        upload(key(&dest, unknown, unknown), false).unwrap();
+        assert_eq!(
+            "hunter2",
+            std::fs::read_to_string(dest.join("secret")).unwrap()
+        );
     }
 }
