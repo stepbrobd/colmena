@@ -159,10 +159,7 @@ impl Local {
         }
 
         let path = key.path();
-        let key_script = format!(
-            "'{}'",
-            key_uploader::generate_script(key, path, require_ownership)
-        );
+        let key_script = key_uploader::generate_script(key, path, require_ownership);
 
         let mut command = self.make_privileged_command(&["sh", "-c", &key_script]);
         command.stdin(Stdio::piped());

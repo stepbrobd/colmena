@@ -395,7 +395,7 @@ impl Ssh {
         let path = key.path();
         let key_script = key_uploader::generate_script(key, path, require_ownership);
 
-        let mut command = self.ssh(&["sh", "-c", key_script.as_ref()]);
+        let mut command = self.ssh_argv(vec!["sh".to_string(), "-c".to_string(), key_script]);
 
         command.stdin(Stdio::piped());
         command.stderr(Stdio::piped());
