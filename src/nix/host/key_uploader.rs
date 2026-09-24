@@ -74,6 +74,7 @@ pub async fn feed_uploader(
 mod tests {
     use std::collections::HashMap;
     use std::path::Path;
+    use std::process::Command;
 
     use tokio_test::block_on;
 
@@ -100,6 +101,11 @@ mod tests {
         block_on(Local::new(NixFlags::default()).upload_keys(&keys, require_ownership))
     }
 
+    fn user() -> String {
+        let output = Command::new("id").arg("-un").output().unwrap();
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
     #[test]
     fn test_local_upload_keeps_bang_in_path() {
         let dir = tempfile::tempdir().unwrap();
@@ -113,5 +119,19 @@ mod tests {
             "hunter2",
             std::fs::read_to_string(dest.join("secret")).unwrap()
         );
+    }
+
+    #[test]
+    fn test_required_owner_with_unknown_group_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = key(dir.path(), &user(), "colmena-no-such-group");
+
+        assert!(upload(key, true).is_err());
+    }
+
+    #[test]
+    fn test_template_has_no_quote_or_bang() {
+        // ssh_argv escapes both in a way a nushell login shell misreads
+        assert!(!super::SCRIPT_TEMPLATE.contains(['\'', '!']));
     }
 }

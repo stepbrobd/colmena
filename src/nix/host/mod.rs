@@ -125,8 +125,8 @@ pub trait Host: Send + Sync + std::fmt::Debug {
     /// Uploads a set of keys to the host.
     ///
     /// If `require_ownership` is false, then the ownership of a key
-    /// will not be applied if the specified user/group does not
-    /// exist.
+    /// will not be applied if chown fails, for example because the
+    /// specified user/group does not exist.
     #[allow(unused_variables)]
     async fn upload_keys(
         &mut self,
