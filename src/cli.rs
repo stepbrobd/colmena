@@ -104,7 +104,7 @@ impl std::fmt::Display for ColorWhen {
     max_term_width = 100,
 )]
 struct Opts {
-    /// Path to a Hive expression, a flake.nix, or a Nix Flake URI
+    /// Path to a hive.nix, a flake.nix, a directory containing a flake.nix, hive.nix or default.nix, or a Nix Flake URI
     #[arg(
         short = 'f',
         long,
