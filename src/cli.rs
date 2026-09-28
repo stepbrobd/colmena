@@ -3,7 +3,7 @@
 use std::env;
 use std::io;
 
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use const_format::{concatcp, formatcp};
 use tracing_subscriber::EnvFilter;
@@ -104,6 +104,35 @@ impl std::fmt::Display for ColorWhen {
     max_term_width = 100,
 )]
 struct Opts {
+    #[command(flatten)]
+    hive: HiveOpts,
+
+    /// When to colorize the output
+    ///
+    /// By default, Colmena enables colorized output when the terminal supports it.
+    ///
+    /// It's also possible to specify the preference using environment variables. See
+    /// <https://bixense.com/clicolors>.
+    #[arg(
+        long,
+        value_name = "WHEN",
+        default_value_t,
+        global = true,
+        display_order = HELP_ORDER_LOW,
+    )]
+    color: ColorWhen,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+/// Global options locating the hive and configuring the Nix commands that
+/// evaluate it.
+///
+/// They are kept apart from the subcommand because the hive is loaded
+/// after the subcommand has been taken out of [`Opts`].
+#[derive(Args)]
+struct HiveOpts {
     /// Path to a Hive expression, a flake.nix, or a Nix Flake URI
     #[arg(
         short = 'f',
@@ -157,24 +186,6 @@ struct Opts {
         hide = true
     )]
     deprecated_experimental_flake_eval_flag: bool,
-
-    /// When to colorize the output
-    ///
-    /// By default, Colmena enables colorized output when the terminal supports it.
-    ///
-    /// It's also possible to specify the preference using environment variables. See
-    /// <https://bixense.com/clicolors>.
-    #[arg(
-        long,
-        value_name = "WHEN",
-        default_value_t,
-        global = true,
-        display_order = HELP_ORDER_LOW,
-    )]
-    color: ColorWhen,
-
-    #[command(subcommand)]
-    command: Command,
 }
 
 #[derive(Subcommand)]
@@ -227,7 +238,7 @@ enum Command {
 }
 
 /// Builds the Nix flags from the CLI options.
-fn get_nix_flags(opts: &Opts) -> NixFlags {
+fn get_nix_flags(opts: &HiveOpts) -> NixFlags {
     let mut flags = NixFlags::default();
     flags.set_show_trace(opts.show_trace);
     flags.set_impure(opts.impure);
@@ -239,7 +250,7 @@ fn get_nix_flags(opts: &Opts) -> NixFlags {
     flags
 }
 
-async fn get_hive(opts: &Opts, flags: NixFlags) -> ColmenaResult<Hive> {
+async fn get_hive(opts: &HiveOpts, flags: NixFlags) -> ColmenaResult<Hive> {
     let path = match &opts.config {
         Some(config) => HivePath::resolve(config, &flags).await?,
         None => {
@@ -314,6 +325,17 @@ async fn get_hive(opts: &Opts, flags: NixFlags) -> ColmenaResult<Hive> {
     Ok(hive)
 }
 
+/// Loads the hive, exiting with code 2 when that fails.
+async fn load_hive(opts: &HiveOpts, flags: NixFlags) -> Hive {
+    match get_hive(opts, flags).await {
+        Ok(hive) => hive,
+        Err(error) => {
+            tracing::error!("Failed to load the hive: {}", error);
+            quit::with_code(2);
+        }
+    }
+}
+
 pub async fn run() {
     let opts = Opts::parse();
 
@@ -325,29 +347,37 @@ pub async fn run() {
         return;
     }
 
-    let flags = get_nix_flags(&opts);
-
-    let hive = match get_hive(&opts, flags.clone()).await {
-        Ok(hive) => hive,
-        Err(error) => {
-            tracing::error!("Failed to load the hive: {}", error);
-            quit::with_code(2);
-        }
-    };
+    let flags = get_nix_flags(&opts.hive);
 
     use crate::troubleshooter::run_wrapped as r;
 
     match opts.command {
-        Command::Apply(args) => r(command::apply::run(hive, args)).await,
+        Command::Apply(args) => {
+            let hive = load_hive(&opts.hive, flags).await;
+            r(command::apply::run(hive, args)).await
+        }
         #[cfg(target_os = "linux")]
-        Command::ApplyLocal(args) => r(command::apply_local::run(hive, args)).await,
-        Command::Eval(args) => r(command::eval::run(hive, args)).await,
-        Command::Exec(args) => r(command::exec::run(hive, args)).await,
+        Command::ApplyLocal(args) => {
+            let hive = load_hive(&opts.hive, flags).await;
+            r(command::apply_local::run(hive, args)).await
+        }
+        Command::Eval(args) => {
+            let hive = load_hive(&opts.hive, flags).await;
+            r(command::eval::run(hive, args)).await
+        }
+        Command::Exec(args) => {
+            let hive = load_hive(&opts.hive, flags).await;
+            r(command::exec::run(hive, args)).await
+        }
         Command::NixInfo => r(command::nix_info::run(flags)).await,
-        Command::Repl => r(command::repl::run(hive)).await,
+        Command::Repl => {
+            let hive = load_hive(&opts.hive, flags).await;
+            r(command::repl::run(hive)).await
+        }
         #[cfg(debug_assertions)]
         Command::TestProgress => r(command::test_progress::run()).await,
         Command::Build { deploy } => {
+            let hive = load_hive(&opts.hive, flags).await;
             let args = command::apply::Opts {
                 deploy,
                 goal: crate::nix::Goal::Build,
@@ -355,6 +385,7 @@ pub async fn run() {
             r(command::apply::run(hive, args)).await
         }
         Command::UploadKeys { deploy } => {
+            let hive = load_hive(&opts.hive, flags).await;
             let args = command::apply::Opts {
                 deploy,
                 goal: crate::nix::Goal::UploadKeys,
