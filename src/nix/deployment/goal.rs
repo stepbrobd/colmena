@@ -23,6 +23,7 @@ pub enum Goal {
     DryActivate,
 
     /// Only upload keys.
+    #[value(name = "keys", alias = "upload-keys")]
     UploadKeys,
 }
 
@@ -85,5 +86,18 @@ impl Goal {
     pub fn requires_target_host(&self) -> bool {
         use Goal::*;
         !matches!(self, Build)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use clap::ValueEnum;
+
+    #[test]
+    fn test_upload_keys_spellings() {
+        assert_eq!(Ok(Goal::UploadKeys), Goal::from_str("keys", false));
+        assert_eq!(Ok(Goal::UploadKeys), Goal::from_str("upload-keys", false));
     }
 }
