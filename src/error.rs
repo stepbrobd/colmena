@@ -76,6 +76,12 @@ pub enum ColmenaError {
         dir.display()
     ))]
     NoHiveFound { dir: PathBuf },
+
+    #[snafu(display(
+        "Could not find flake.nix, hive.nix or default.nix in {}",
+        dir.display()
+    ))]
+    NoHiveInDirectory { dir: PathBuf },
 }
 
 impl From<std::io::Error> for ColmenaError {

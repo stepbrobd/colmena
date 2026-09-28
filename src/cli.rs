@@ -133,7 +133,7 @@ struct Opts {
 /// after the subcommand has been taken out of [`Opts`].
 #[derive(Args)]
 struct HiveOpts {
-    /// Path to a Hive expression, a flake.nix, or a Nix Flake URI
+    /// Path to a hive.nix, a flake.nix, a directory containing a flake.nix, hive.nix or default.nix, or a Nix Flake URI
     #[arg(
         short = 'f',
         long,

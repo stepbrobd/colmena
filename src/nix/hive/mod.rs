@@ -17,7 +17,7 @@ use super::{
     Flake, MetaConfig, NixCommand, NixExpression, NixFlags, NodeConfig, NodeFilter, NodeName,
     ProfileDerivation, SerializedNixExpression, StorePath,
 };
-use crate::error::ColmenaResult;
+use crate::error::{ColmenaError, ColmenaResult};
 use crate::job::JobHandle;
 use crate::util::{CommandExecution, CommandExt};
 use assets::Assets;
@@ -124,6 +124,27 @@ struct EvalSelectedExpression<'hive> {
 impl HivePath {
     pub async fn from_path<P: AsRef<Path>>(path: P, flags: &NixFlags) -> ColmenaResult<Self> {
         let path = path.as_ref();
+
+        // a directory stands for the flake.nix, hive.nix or default.nix in it
+        let path = if path.is_dir() {
+            let flake = path.join("flake.nix");
+            let legacy = path.join("hive.nix");
+            let default = path.join("default.nix");
+
+            if flake.is_file() {
+                flake
+            } else if legacy.is_file() {
+                legacy
+            } else if default.is_file() {
+                default
+            } else {
+                return Err(ColmenaError::NoHiveInDirectory {
+                    dir: path.to_owned(),
+                });
+            }
+        } else {
+            path.to_owned()
+        };
 
         if let Some(osstr) = path.file_name()
             && osstr == "flake.nix"

@@ -97,6 +97,47 @@ impl Deref for TempHive {
     }
 }
 
+#[test]
+fn test_hive_path_from_dir() {
+    let dir = TempFileBuilder::new()
+        .prefix("hive-dir-")
+        .tempdir()
+        .unwrap();
+    let hive_nix = dir.path().join("hive.nix");
+    fs::write(&hive_nix, "{ }").unwrap();
+
+    let path = block_on(HivePath::from_path(dir.path(), &NixFlags::default())).unwrap();
+
+    assert!(matches!(path, HivePath::Legacy(p) if p == hive_nix.canonicalize().unwrap()));
+
+    // default.nix is the last candidate
+    let dir = TempFileBuilder::new()
+        .prefix("hive-dir-")
+        .tempdir()
+        .unwrap();
+    let default_nix = dir.path().join("default.nix");
+    fs::write(&default_nix, "{ }").unwrap();
+
+    let path = block_on(HivePath::from_path(dir.path(), &NixFlags::default())).unwrap();
+
+    assert!(matches!(path, HivePath::Legacy(p) if p == default_nix.canonicalize().unwrap()));
+}
+
+#[test]
+fn test_hive_path_from_empty_dir() {
+    let dir = TempFileBuilder::new()
+        .prefix("hive-dir-")
+        .tempdir()
+        .unwrap();
+
+    let result = block_on(HivePath::from_path(dir.path(), &NixFlags::default()));
+
+    assert!(matches!(
+        result,
+        Err(ColmenaError::NoHiveInDirectory { .. })
+    ));
+}
+
 // eval.nix tests
 
 #[test]
