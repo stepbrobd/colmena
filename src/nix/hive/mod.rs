@@ -455,10 +455,15 @@ impl Hive {
 
     /// Evaluates an expression using values from the configuration.
     pub async fn introspect(&self, expression: String, instantiate: bool) -> ColmenaResult<String> {
+        // the newlines keep a comment on the last line of a file from
+        // swallowing the closing parenthesis
         if instantiate {
             // the eval command of both hive kinds instantiates the
             // derivations whose drvPath it forces
-            let expression = format!("{} (hive.introspect ({}))", DRV_PATHS_SNIPPET, expression);
+            let expression = format!(
+                "{} (hive.introspect (\n{}\n))",
+                DRV_PATHS_SNIPPET, expression
+            );
             let paths: Vec<String> = self
                 .nix_instantiate(&expression)
                 .eval_with_builders()
@@ -474,7 +479,7 @@ impl Hive {
                 .map(|path| format!("{}\n", path))
                 .collect())
         } else {
-            let expression = format!("toJSON (hive.introspect ({}))", expression);
+            let expression = format!("toJSON (hive.introspect (\n{}\n))", expression);
             self.nix_instantiate(&expression)
                 .eval_with_builders()
                 .await?
@@ -512,7 +517,7 @@ impl Hive {
     }
 
     /// Returns whether this Hive is a flake.
-    fn is_flake(&self) -> bool {
+    pub fn is_flake(&self) -> bool {
         matches!(self.path(), HivePath::Flake(_))
     }
 

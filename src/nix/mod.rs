@@ -205,6 +205,10 @@ impl NixFlags {
         self.impure = impure;
     }
 
+    pub fn impure(&self) -> bool {
+        self.impure
+    }
+
     pub fn add_option(&mut self, name: String, value: String) {
         self.options.insert(name, value);
     }
