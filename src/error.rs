@@ -82,6 +82,12 @@ pub enum ColmenaError {
         dir.display()
     ))]
     NoHiveInDirectory { dir: PathBuf },
+
+    #[snafu(display("Could not read {}: {}", path.display(), error))]
+    ExpressionFileError {
+        path: PathBuf,
+        error: std::io::Error,
+    },
 }
 
 impl From<std::io::Error> for ColmenaError {

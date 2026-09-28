@@ -453,15 +453,17 @@ impl Hive {
 
     /// Evaluates an expression using values from the configuration.
     pub async fn introspect(&self, expression: String, instantiate: bool) -> ColmenaResult<String> {
+        // the newlines keep a comment on the last line of a file from
+        // swallowing the closing parenthesis
         if instantiate {
-            let expression = format!("hive.introspect ({})", expression);
+            let expression = format!("hive.introspect (\n{}\n)", expression);
             self.nix_instantiate(&expression)
                 .instantiate_with_builders()
                 .await?
                 .capture_output()
                 .await
         } else {
-            let expression = format!("toJSON (hive.introspect ({}))", expression);
+            let expression = format!("toJSON (hive.introspect (\n{}\n))", expression);
             self.nix_instantiate(&expression)
                 .eval_with_builders()
                 .await?
@@ -484,7 +486,7 @@ impl Hive {
     }
 
     /// Returns whether this Hive is a flake.
-    fn is_flake(&self) -> bool {
+    pub fn is_flake(&self) -> bool {
         matches!(self.path(), HivePath::Flake(_))
     }
 
