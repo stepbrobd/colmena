@@ -47,7 +47,7 @@ impl TempHive {
         temp_file.write_all(text.as_bytes()).unwrap();
 
         let hive_path = block_on(HivePath::from_path(temp_file.path(), &flags)).unwrap();
-        let hive = block_on(Hive::new(hive_path, flags)).unwrap();
+        let hive = Hive::new(hive_path, flags).unwrap();
 
         Self {
             hive,
@@ -263,18 +263,20 @@ fn test_flake_from_relative_dir() {
     assert!(matches!(path.unwrap(), HivePath::Flake(_)));
 }
 
-#[test]
-fn test_parse_makehive_flake() {
-    let flake_dir = makehive_flake_dir();
-
-    // run the test
-    let flake = block_on(Flake::from_dir(flake_dir.as_ref(), &NixFlags::default())).unwrap();
+/// Loads the makehive flake in the given directory as a hive.
+fn makehive_flake(flake_dir: &Path) -> Hive {
+    let flake = block_on(Flake::from_dir(flake_dir, &NixFlags::default())).unwrap();
 
     let mut flags = NixFlags::default();
     flags.set_show_trace(true);
 
-    let hive_path = HivePath::Flake(flake);
-    let mut hive = block_on(Hive::new(hive_path, flags)).unwrap();
+    Hive::new(HivePath::Flake(flake), flags).unwrap()
+}
+
+#[test]
+fn test_parse_makehive_flake() {
+    let flake_dir = makehive_flake_dir();
+    let hive = makehive_flake(flake_dir.path());
 
     let nodes = block_on(hive.deployment_info()).unwrap();
     assert!(set_eq(
@@ -292,18 +294,83 @@ fn test_parse_makehive_flake() {
         assert!(expr.contains("host-a"));
     }
 
-    // nix-eval-jobs --expr <expr>
-    {
-        hive.set_evaluation_method(EvaluationMethod::NixInstantiate);
-        assert!(
-            hive.eval_selected_expr(&[node!("host-a")])
-                .unwrap()
-                .installable()
-                .is_none()
-        );
-    }
-
     drop(flake_dir);
+}
+
+#[test]
+fn test_repl_expression_flake_evaluates() {
+    let flake_dir = makehive_flake_dir();
+    let hive = makehive_flake(flake_dir.path());
+
+    let mut expr_file = TempFileBuilder::new()
+        .prefix("colmena-repl-")
+        .suffix(".nix")
+        .tempfile()
+        .unwrap();
+    expr_file
+        .write_all(hive.get_repl_expression().as_bytes())
+        .unwrap();
+
+    // nix repl is impure, and getFlake on an unlocked ref needs that
+    let mut flags = NixFlags::default();
+    flags.set_impure(true);
+
+    let output = block_on(
+        NixCommand::nix(flags)
+            .args(["eval", "--file"])
+            .arg(expr_file.path())
+            .args(["--apply", "s: builtins.attrNames s.nodes"])
+            .build()
+            .capture_output(),
+    )
+    .unwrap();
+
+    assert!(output.contains("host-a"));
+    assert!(output.contains("host-b"));
+}
+
+#[test]
+fn test_introspect_instantiate_flake() {
+    let flake_dir = makehive_flake_dir();
+    let hive = makehive_flake(flake_dir.path());
+
+    let expr = "{ nodes, ... }: nodes.host-a.config.system.build.toplevel".to_string();
+    let output = block_on(hive.introspect(expr, true)).unwrap();
+
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(1, lines.len());
+    assert!(lines[0].ends_with(".drv"));
+    assert!(output.ends_with('\n'));
+}
+
+#[test]
+fn test_drv_paths_snippet() {
+    // fake derivations, nothing is instantiated
+    let fixture = r#"
+      let
+        fakeDrv = name: { type = "derivation"; drvPath = "/nix/store/${name}.drv"; outputName = "out"; };
+      in {
+        a = fakeDrv "a";
+        b = "str";
+        c = { recurseForDerivations = true; d = fakeDrv "d"; };
+        e = { f = fakeDrv "f"; };
+        g = (fakeDrv "g") // { outputName = "bin"; };
+      }
+    "#;
+
+    let output = block_on(
+        NixCommand::nix(NixFlags::default())
+            .args(["eval", "--json", "--expr"])
+            .arg(format!("{} ({})", DRV_PATHS_SNIPPET, fixture))
+            .build()
+            .capture_output(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        r#"["/nix/store/a.drv","/nix/store/d.drv","/nix/store/g.drv!bin"]"#,
+        output.trim()
+    );
 }
 
 #[test]

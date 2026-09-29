@@ -100,20 +100,3 @@ impl FlakeMetadata {
         })
     }
 }
-
-/// Quietly locks the dependencies of a flake.
-pub async fn lock_flake_quiet(uri: &str, flags: &NixFlags) -> ColmenaResult<()> {
-    let status = NixCommand::nix(flags.clone())
-        .args(["flake", "lock"])
-        .arg(uri)
-        .build()
-        .stderr(Stdio::null())
-        .status()
-        .await?;
-
-    if !status.success() {
-        return Err(status.into());
-    }
-
-    Ok(())
-}
