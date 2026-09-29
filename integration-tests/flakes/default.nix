@@ -36,6 +36,17 @@ tools.runTest {
       with subtest("Lock flake dependencies"):
           deployer.succeed("cd /tmp/bundle && nix --extra-experimental-features \"nix-command flakes\" flake lock")
 
+      with subtest("Evaluate, instantiate and inspect the hive"):
+          deployer.succeed("echo '{ nodes, ... }: builtins.attrNames nodes' > /tmp/names.nix")
+          names = deployer.succeed("cd /tmp/bundle && ${tools.colmenaExec} eval /tmp/names.nix")
+          assert "alpha" in names
+
+          drv = deployer.succeed("cd /tmp/bundle && ${tools.colmenaExec} eval --instantiate -E '{ nodes, ... }: nodes.alpha.config.system.build.toplevel'")
+          assert drv.strip().endswith(".drv")
+
+          repl = deployer.succeed("cd /tmp/bundle && echo 'builtins.attrNames nodes' | ${tools.colmenaExec} repl")
+          assert "alpha" in repl
+
       with subtest("Deploy with a plain flake without git"):
           deployer.succeed("cd /tmp/bundle && ${tools.colmenaExec} apply --on @target ${applyFlags}")
           alpha.succeed("grep FIRST /etc/deployment")
