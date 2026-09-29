@@ -16,6 +16,8 @@ $ colmena eval target-hosts.nix
 {"alpha":"fd12:3456::1","beta":"fd12:3456::2"}
 ```
 
+On a flake hive, the file is evaluated as text under pure evaluation, which means relative paths in it resolve against the working directory and cannot be read, and error positions refer to the expression, unless `--impure` is passed.
+
 You can also specify an expression directly on the command line:
 
 ```console
