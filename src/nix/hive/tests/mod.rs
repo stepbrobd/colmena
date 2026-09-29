@@ -410,6 +410,31 @@ fn test_drv_paths_snippet() {
 }
 
 #[test]
+fn test_flake_from_relative_dir() {
+    // a flake without inputs, nothing is fetched
+    let flake_dir = TempFileBuilder::new().prefix("flake-").tempdir().unwrap();
+    fs::write(
+        flake_dir.path().join("flake.nix"),
+        "{ outputs = { self }: { }; }",
+    )
+    .unwrap();
+
+    // a path relative to the crate root without a leading dot, which nix reads as a flake id
+    // the flake stays outside the repository behind a symlink, because nix reads a
+    // directory inside it through git and ignores untracked files
+    let link_dir = TempFileBuilder::new()
+        .prefix("flake-link-")
+        .tempdir_in(".")
+        .unwrap();
+    std::os::unix::fs::symlink(flake_dir.path(), link_dir.path().join("flake")).unwrap();
+    let relative = Path::new(link_dir.path().file_name().unwrap()).join("flake/flake.nix");
+
+    let path = block_on(HivePath::from_path(relative, &NixFlags::default()));
+
+    assert!(matches!(path.unwrap(), HivePath::Flake(_)));
+}
+
+#[test]
 fn test_parse_node_references() {
     TempHive::valid(
         r#"
