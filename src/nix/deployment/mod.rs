@@ -570,7 +570,7 @@ impl Deployment {
                 job.state(JobState::Running)?;
                 job.message("Uploading pre-activation keys...".to_string())?;
 
-                let host = target.host.as_mut().unwrap();
+                let host = target.host.as_mut().ok_or(ColmenaError::NoTargetHost)?;
                 host.set_job(Some(job.clone()));
                 host.upload_keys(&keys, false).await?;
 
@@ -587,7 +587,7 @@ impl Deployment {
         let arc_self = self.clone();
         let profile_r = profile.clone();
         let mut target = activation_job.run(|job| async move {
-            let host = target.host.as_mut().unwrap();
+            let host = target.host.as_mut().ok_or(ColmenaError::NoTargetHost)?;
             host.set_job(Some(job.clone()));
 
             if !target.config.replace_unknown_profiles {
@@ -618,7 +618,7 @@ impl Deployment {
             let job = parent.create_job(JobType::Reboot, nodes.clone())?;
             let arc_self = self.clone();
             job.run(|job| async move {
-                let host = target.host.as_mut().unwrap();
+                let host = target.host.as_mut().ok_or(ColmenaError::NoTargetHost)?;
                 host.set_job(Some(job.clone()));
 
                 let new_profile = if arc_self.goal.persists_after_reboot() {
@@ -660,7 +660,7 @@ impl Deployment {
                 job.state(JobState::Running)?;
                 job.message("Uploading post-activation keys...".to_string())?;
 
-                let host = target.host.as_mut().unwrap();
+                let host = target.host.as_mut().ok_or(ColmenaError::NoTargetHost)?;
                 host.set_job(Some(job.clone()));
                 host.upload_keys(&keys, true).await?;
 
