@@ -12,7 +12,7 @@ use tracing_subscriber::filter::LevelFilter;
 use crate::{
     command::{self, apply::DeployOpts},
     error::{ColmenaError, ColmenaResult},
-    nix::{Hive, HivePath, NixFlags, hive::EvaluationMethod},
+    nix::{Hive, HivePath, NixFlags},
 };
 
 /// Base URL of the manual, without the trailing slash.
@@ -169,23 +169,6 @@ struct HiveOpts {
         value_names = ["NAME", "VALUE"],
     )]
     nix_option: Vec<String>,
-
-    /// Use legacy flake evaluation (deprecated)
-    ///
-    /// If enabled, flakes will be evaluated using `builtins.getFlake` with the `nix-instantiate` CLI.
-    #[arg(long, default_value_t, global = true, hide = true)]
-    legacy_flake_eval: bool,
-
-    /// This flag no longer has an effect
-    ///
-    /// Previously, it enabled direct flake evaluation which is now the default.
-    #[arg(
-        long = "experimental-flake-eval",
-        default_value_t,
-        global = true,
-        hide = true
-    )]
-    deprecated_experimental_flake_eval_flag: bool,
 }
 
 #[derive(Subcommand)]
@@ -300,29 +283,7 @@ async fn get_hive(opts: &HiveOpts, flags: NixFlags) -> ColmenaResult<Hive> {
         }
     }
 
-    let mut hive = Hive::new(path, flags).await?;
-
-    if opts.deprecated_experimental_flake_eval_flag {
-        tracing::error!(
-            "--experimental-flake-eval is now the default and this flag no longer has an effect"
-        );
-        return Err(ColmenaError::Unsupported);
-    }
-
-    if opts.legacy_flake_eval {
-        tracing::warn!("Using legacy flake eval (deprecated)");
-        tracing::warn!(
-            r#"Consider upgrading to the new evaluator by adding Colmena as an input and expose the `colmenaHive` output:
-  outputs = {{ self, colmena, ... }}: {{
-    colmenaHive = colmena.lib.makeHive self.outputs.colmena;
-    colmena = ...;
-    }};
-"#
-        );
-        hive.set_evaluation_method(EvaluationMethod::NixInstantiate);
-    }
-
-    Ok(hive)
+    Hive::new(path, flags)
 }
 
 /// Loads the hive, exiting with code 2 when that fails.
