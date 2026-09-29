@@ -10,9 +10,9 @@ use std::hash::Hash;
 use std::io::Write;
 use std::iter::{FromIterator, Iterator};
 use std::ops::Deref;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use tempfile::{Builder as TempFileBuilder, NamedTempFile};
+use tempfile::{Builder as TempFileBuilder, NamedTempFile, TempDir};
 use tokio_test::block_on;
 
 macro_rules! node {
@@ -212,9 +212,9 @@ fn test_parse_simple() {
     assert_eq!(Some("luser"), host_b.target_user.as_deref());
 }
 
-#[test]
-fn test_parse_makehive_flake() {
-    // make a copy of the flake so we can edit the colmena input
+/// Copies the makehive flake into a temporary directory with the colmena
+/// input pointed at this checkout.
+fn makehive_flake_dir() -> TempDir {
     let src_dir = PathBuf::from("./src/nix/hive/tests/makehive-flake");
     let flake_dir = TempFileBuilder::new()
         .prefix("makehive-flake-")
@@ -234,6 +234,38 @@ fn test_parse_makehive_flake() {
         .replace("@repoPath@", env!("CARGO_MANIFEST_DIR"));
 
     fs::write(flake_nix, patched_flake).unwrap();
+
+    flake_dir
+}
+
+#[test]
+fn test_flake_from_relative_dir() {
+    // a flake without inputs, nothing is fetched
+    let flake_dir = TempFileBuilder::new().prefix("flake-").tempdir().unwrap();
+    fs::write(
+        flake_dir.path().join("flake.nix"),
+        "{ outputs = { self }: { }; }",
+    )
+    .unwrap();
+
+    // a path relative to the crate root without a leading dot, which nix reads as a flake id
+    // the flake stays outside the repository behind a symlink, because nix reads a
+    // directory inside it through git and ignores untracked files
+    let link_dir = TempFileBuilder::new()
+        .prefix("flake-link-")
+        .tempdir_in(".")
+        .unwrap();
+    std::os::unix::fs::symlink(flake_dir.path(), link_dir.path().join("flake")).unwrap();
+    let relative = Path::new(link_dir.path().file_name().unwrap()).join("flake/flake.nix");
+
+    let path = block_on(HivePath::from_path(relative, &NixFlags::default()));
+
+    assert!(matches!(path.unwrap(), HivePath::Flake(_)));
+}
+
+#[test]
+fn test_parse_makehive_flake() {
+    let flake_dir = makehive_flake_dir();
 
     // run the test
     let flake = block_on(Flake::from_dir(flake_dir.as_ref(), &NixFlags::default())).unwrap();

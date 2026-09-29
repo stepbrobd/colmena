@@ -88,6 +88,12 @@ pub enum ColmenaError {
         path: PathBuf,
         error: std::io::Error,
     },
+
+    #[snafu(display("Could not resolve {}: {}", path.display(), error))]
+    HivePathError {
+        path: PathBuf,
+        error: std::io::Error,
+    },
 }
 
 impl From<std::io::Error> for ColmenaError {

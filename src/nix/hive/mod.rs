@@ -125,6 +125,15 @@ impl HivePath {
     pub async fn from_path<P: AsRef<Path>>(path: P, flags: &NixFlags) -> ColmenaResult<Self> {
         let path = path.as_ref();
 
+        // an absolute path gives a bare file name a parent, and keeps nix from
+        // reading a relative path without a leading dot as a flake id
+        let path = path
+            .canonicalize()
+            .map_err(|error| ColmenaError::HivePathError {
+                path: path.to_owned(),
+                error,
+            })?;
+
         // a directory stands for the flake.nix, hive.nix or default.nix in it
         let path = if path.is_dir() {
             let flake = path.join("flake.nix");
@@ -138,12 +147,10 @@ impl HivePath {
             } else if default.is_file() {
                 default
             } else {
-                return Err(ColmenaError::NoHiveInDirectory {
-                    dir: path.to_owned(),
-                });
+                return Err(ColmenaError::NoHiveInDirectory { dir: path });
             }
         } else {
-            path.to_owned()
+            path
         };
 
         if let Some(osstr) = path.file_name()
@@ -154,7 +161,7 @@ impl HivePath {
             return Ok(Self::Flake(flake));
         }
 
-        Ok(Self::Legacy(path.canonicalize()?))
+        Ok(Self::Legacy(path))
     }
 
     fn is_flake(&self) -> bool {
